@@ -50,6 +50,11 @@ struct DropperArchiveProviderData (
     displayName
 )
 
+struct DropperPlacementData (
+    hasPlacedGroup = false,
+    nextX = 0.0
+)
+
 struct DropperAppManager (
     versionContent = "1.0.0",
     entryFilePath = "",
@@ -1331,17 +1336,6 @@ struct DropperAppManager (
         return candidateData
     ),
 
-    fn onCandidateListDrawItem senderObject eventArgs = (
-        if (eventArgs.Index < 0) do return false
-        local isSelected = senderObject.SelectedIndex == eventArgs.Index
-        local backgroundColor = if isSelected then themeAccentColor() else themeInputColor()
-        local foregroundColor = themeTextColor()
-        local itemContent = senderObject.Items.Item[eventArgs.Index] as string
-        local textFlags = (dotNetClass "System.Windows.Forms.TextFormatFlags").Left
-        (dotNetClass "System.Windows.Forms.TextRenderer").DrawText eventArgs.Graphics itemContent senderObject.Font eventArgs.Bounds foregroundColor backgroundColor textFlags
-        return true
-    ),
-
     fn chooseSceneCandidate candidateArray dialogTitle = (
         if (candidateArray.count == 0) do return undefined
         if (candidateArray.count == 1) do return candidateArray[1]
@@ -1364,9 +1358,7 @@ struct DropperAppManager (
         candidateListBox.BackColor = themeInputColor()
         candidateListBox.ForeColor = themeTextColor()
         candidateListBox.BorderStyle = (dotNetClass "System.Windows.Forms.BorderStyle").None
-        candidateListBox.DrawMode = (dotNetClass "System.Windows.Forms.DrawMode").OwnerDrawFixed
         candidateListBox.IntegralHeight = false
-        candidateListBox.ItemHeight = 18
         candidateListBox.HorizontalScrollbar = true
         for candidateData in candidateArray do (
             local displayContent = (dotNetClass "System.IO.Path").GetFileName candidateData.sourceFilePath
@@ -1393,8 +1385,6 @@ struct DropperAppManager (
         chooserForm.Controls.Add cancelButton
         chooserForm.AcceptButton = useButton
         chooserForm.CancelButton = cancelButton
-        dotNet.addEventHandler candidateListBox "DrawItem" onCandidateListDrawItem
-        dotNet.setLifetimeControl candidateListBox #dotnet
         local dialogResult = chooserForm.ShowDialog mainForm
         local selectedIndex = candidateListBox.SelectedIndex
         chooserForm.Dispose()
@@ -1507,6 +1497,44 @@ struct DropperAppManager (
         if (not hasBounds) do return false
         local zOffset = -minimumZ
         for rootNode in (getRootNodes sceneNodeArray) do try (rootNode.pos.z += zOffset) catch()
+        return true
+    ),
+
+    fn getSceneNodeBounds sceneNodeArray = (
+        if (sceneNodeArray.count == 0) do return undefined
+        local minimumBounds = [1e30, 1e30, 1e30]
+        local maximumBounds = [-1e30, -1e30, -1e30]
+        local hasBounds = false
+        for sceneNode in sceneNodeArray do (
+            try (
+                local nodeBounds = nodeGetBoundingBox sceneNode (matrix3 1)
+                minimumBounds.x = amin minimumBounds.x nodeBounds[1].x nodeBounds[2].x
+                minimumBounds.y = amin minimumBounds.y nodeBounds[1].y nodeBounds[2].y
+                minimumBounds.z = amin minimumBounds.z nodeBounds[1].z nodeBounds[2].z
+                maximumBounds.x = amax maximumBounds.x nodeBounds[1].x nodeBounds[2].x
+                maximumBounds.y = amax maximumBounds.y nodeBounds[1].y nodeBounds[2].y
+                maximumBounds.z = amax maximumBounds.z nodeBounds[1].z nodeBounds[2].z
+                hasBounds = true
+            ) catch()
+        )
+        if (not hasBounds) do return undefined
+        return #(minimumBounds, maximumBounds)
+    ),
+
+    fn placeSceneNodeGroup sceneNodeArray placementData = (
+        if (placementData == undefined or sceneNodeArray.count == 0) do return false
+        local groupBounds = getSceneNodeBounds sceneNodeArray
+        if (groupBounds == undefined) do return false
+        local groupWidth = groupBounds[2].x - groupBounds[1].x
+        local spacingSize = amax ((units.decodeValue "0.1m")) (groupWidth * 0.1)
+        if (placementData.hasPlacedGroup) do (
+            local xOffset = placementData.nextX - groupBounds[1].x
+            for rootNode in (getRootNodes sceneNodeArray) do try (rootNode.pos.x += xOffset) catch()
+            groupBounds[1].x += xOffset
+            groupBounds[2].x += xOffset
+        )
+        placementData.nextX = groupBounds[2].x + spacingSize
+        placementData.hasPlacedGroup = true
         return true
     ),
 
@@ -1660,9 +1688,10 @@ struct DropperAppManager (
         return relinkData
     ),
 
-    fn postProcessImportedNodes sceneNodeArray sourceFilePath searchFolderPath = (
+    fn postProcessImportedNodes sceneNodeArray sourceFilePath searchFolderPath placementData:undefined = (
         if (sceneNodeArray.count == 0) do return false
         if (not groundNewNodes sceneNodeArray) do addLog "Could not calculate model bounds; Z position was preserved." severityLevel:2
+        if (placementData != undefined and not (placeSceneNodeGroup sceneNodeArray placementData)) do addLog "Could not calculate model bounds; horizontal placement was preserved." severityLevel:2
         assignNodesToUniqueLayer sceneNodeArray sourceFilePath
         relinkTextures sceneNodeArray searchFolderPath
         try (select sceneNodeArray; max tool zoomextents all) catch (addLog "Viewport zoom could not be completed." severityLevel:2)
@@ -1670,7 +1699,7 @@ struct DropperAppManager (
         return true
     ),
 
-    fn processModelCandidate candidateData searchFolderPath layerSourceFilePath:undefined = (
+    fn processModelCandidate candidateData searchFolderPath layerSourceFilePath:undefined placementData:undefined = (
         if (candidateData == undefined) do return false
         local effectiveLayerSourceFilePath = if layerSourceFilePath == undefined then candidateData.sourceFilePath else layerSourceFilePath
         local handlesBefore = collectSceneNodeHandles()
@@ -1687,7 +1716,7 @@ struct DropperAppManager (
             if (newSceneNodes.count > 0) do try (delete newSceneNodes) catch()
             return false
         )
-        postProcessImportedNodes newSceneNodes effectiveLayerSourceFilePath searchFolderPath
+        postProcessImportedNodes newSceneNodes effectiveLayerSourceFilePath searchFolderPath placementData:placementData
         addLog ("Imported " + (newSceneNodes.count as string) + " node(s) from: " + candidateData.sourceFilePath) severityLevel:1
         return true
     ),
@@ -1725,7 +1754,7 @@ struct DropperAppManager (
         return false
     ),
 
-    fn createImagePlanes imageFilePaths = (
+    fn createImagePlanes imageFilePaths placementData:undefined = (
         local imageDataArray = #()
         local totalWidth = 0.0
         local spacingSize = (units.decodeValue "1m") * 0.1
@@ -1773,6 +1802,7 @@ struct DropperAppManager (
             append createdPlanes planeNode
             currentX += planeWidth + spacingSize
         )
+        if (placementData != undefined and not (placeSceneNodeGroup createdPlanes placementData)) do addLog "Could not calculate image bounds; horizontal placement was preserved." severityLevel:2
         if (settingsData.createUniqueLayer) do assignNodesToUniqueLayer createdPlanes imageFilePaths[1]
         try (
             select createdPlanes
@@ -2051,14 +2081,14 @@ struct DropperAppManager (
         return (not isCancelRequested)
     ),
 
-    fn processArchiveContents extractionRoot archiveFilePath = (
+    fn processArchiveContents extractionRoot archiveFilePath placementData:undefined = (
         local maxCandidate = selectMaxCandidate extractionRoot
         local isSuccessful = false
-        if (maxCandidate != undefined) do isSuccessful = processModelCandidate maxCandidate extractionRoot layerSourceFilePath:archiveFilePath
+        if (maxCandidate != undefined) do isSuccessful = processModelCandidate maxCandidate extractionRoot layerSourceFilePath:archiveFilePath placementData:placementData
         if (not isSuccessful) do (
             local fallbackCandidate = selectFallbackCandidate extractionRoot
             if (fallbackCandidate != undefined) then (
-                isSuccessful = processModelCandidate fallbackCandidate extractionRoot layerSourceFilePath:archiveFilePath
+                isSuccessful = processModelCandidate fallbackCandidate extractionRoot layerSourceFilePath:archiveFilePath placementData:placementData
             ) else (
                 addLog ("No supported model was found in: " + extractionRoot) severityLevel:3
             )
@@ -2066,7 +2096,7 @@ struct DropperAppManager (
         return isSuccessful
     ),
 
-    fn processArchiveFile archiveFilePath = (
+    fn processArchiveFile archiveFilePath placementData:undefined = (
         local extractionRoot = ""
         try (
             extractionRoot = getExtractionRoot archiveFilePath
@@ -2076,10 +2106,10 @@ struct DropperAppManager (
             return false
         )
         if (not extractArchiveTree archiveFilePath extractionRoot) do return false
-        return processArchiveContents extractionRoot archiveFilePath
+        return processArchiveContents extractionRoot archiveFilePath placementData:placementData
     ),
 
-    fn processDirectModel modelFilePath = (
+    fn processDirectModel modelFilePath placementData:undefined = (
         local fileExtension = toLower ((dotNetClass "System.IO.Path").GetExtension modelFilePath)
         local sourceFolderPath = (dotNetClass "System.IO.Path").GetDirectoryName modelFilePath
         local candidateData = DropperSceneCandidateData sourceFilePath:modelFilePath relativeFilePath:modelFilePath fileExtension:fileExtension rendererTag:(if fileExtension == ".max" then getRendererTagFromFile modelFilePath else "other")
@@ -2091,7 +2121,7 @@ struct DropperAppManager (
             )
             if (candidateData.warningMessage != "") do addLog (candidateData.warningMessage + ": " + modelFilePath) severityLevel:2
         )
-        return processModelCandidate candidateData sourceFolderPath
+        return processModelCandidate candidateData sourceFolderPath placementData:placementData
     ),
 
     fn convertFileCollection fileCollection = (
@@ -2118,6 +2148,7 @@ struct DropperAppManager (
         isBusy = true
         isCancelRequested = false
         local imageFilePaths = #()
+        local placementData = DropperPlacementData()
         local successfulCount = 0
         local failedCount = 0
 
@@ -2129,9 +2160,9 @@ struct DropperAppManager (
                 setStatus ("Processing " + (dotNetClass "System.IO.Path").GetFileName sourceFilePath)
                 try (
                     if (isArchiveExtension fileExtension) then (
-                        isSuccessful = processArchiveFile sourceFilePath
+                        isSuccessful = processArchiveFile sourceFilePath placementData:placementData
                     ) else if (isModelExtension fileExtension) then (
-                        isSuccessful = processDirectModel sourceFilePath
+                        isSuccessful = processDirectModel sourceFilePath placementData:placementData
                     ) else if (isReadableBitmap sourceFilePath) then (
                         append imageFilePaths sourceFilePath
                         isDeferredImage = true
@@ -2154,7 +2185,7 @@ struct DropperAppManager (
 
         if (imageFilePaths.count > 0 and not isCancelRequested) do (
             setStatus "Creating image planes"
-            if (createImagePlanes imageFilePaths) then successfulCount += imageFilePaths.count else failedCount += imageFilePaths.count
+            if (createImagePlanes imageFilePaths placementData:placementData) then successfulCount += imageFilePaths.count else failedCount += imageFilePaths.count
         )
 
         if (isCancelRequested) then (
