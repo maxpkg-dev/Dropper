@@ -646,8 +646,8 @@ struct DropperAppManager (
             try (
                 sourceCloseImage = (dotNetClass "System.Drawing.Image").FromFile closeIconPath
                 orientationCloseImage = dotNetObject "System.Drawing.Bitmap" sourceCloseImage
-                closeOrientationButton.Image = orientationCloseImage
-                closeOrientationButton.ImageAlign = (dotNetClass "System.Drawing.ContentAlignment").MiddleCenter
+                closeOrientationButton.BackgroundImage = orientationCloseImage
+                closeOrientationButton.BackgroundImageLayout = (dotNetClass "System.Windows.Forms.ImageLayout").Center
             ) catch (
                 orientationCloseImage = undefined
             )
