@@ -13,6 +13,7 @@ struct DropperSettingsData (
     renameDuplicateNodes = true,
     renameDuplicateMaterials = true,
     createUniqueLayer = false,
+    neverShowOrientationPanel = false,
     windowX = -1,
     windowY = -1
 )
@@ -60,9 +61,12 @@ struct DropperAppManager (
     dropPanelImage = undefined,
     statusLabel = undefined,
     logButton = undefined,
+    logBorderPanel = undefined,
     logBox = undefined,
     helpForm = undefined,
     settingsForm = undefined,
+    orientationForm = undefined,
+    orientationCloseImage = undefined,
     settingsExtractNextCheck = undefined,
     settingsExtractFolderBox = undefined,
     settingsExtractBrowseButton = undefined,
@@ -71,8 +75,13 @@ struct DropperAppManager (
     settingsRenameNodesCheck = undefined,
     settingsRenameMaterialsCheck = undefined,
     settingsUniqueLayerCheck = undefined,
+    settingsOrientationPanelCheck = undefined,
     deferredDropTimer = undefined,
     deferredDropFilePaths = #(),
+    updateCheckTimer = undefined,
+    idlePromotionTimer = undefined,
+    logPromotionTimer = undefined,
+    logPromotionLinks = #(),
     statusLinkUrl = "",
     isLogVisible = false,
     highestSeverity = 0,
@@ -213,6 +222,7 @@ struct DropperAppManager (
             settingsData.renameDuplicateNodes = readBooleanSetting "SafeMerge" "RenameDuplicateNodes" true
             settingsData.renameDuplicateMaterials = readBooleanSetting "SafeMerge" "RenameDuplicateMaterials" true
             settingsData.createUniqueLayer = readBooleanSetting "SafeMerge" "CreateUniqueLayer" false
+            settingsData.neverShowOrientationPanel = readBooleanSetting "Interface" "NeverShowOrientationPanel" false
             settingsData.windowX = readIntegerSetting "Window" "X" -1
             settingsData.windowY = readIntegerSetting "Window" "Y" -1
         )
@@ -235,6 +245,7 @@ struct DropperAppManager (
             setINISetting temporaryIniPath "SafeMerge" "RenameDuplicateNodes" (settingsData.renameDuplicateNodes as string)
             setINISetting temporaryIniPath "SafeMerge" "RenameDuplicateMaterials" (settingsData.renameDuplicateMaterials as string)
             setINISetting temporaryIniPath "SafeMerge" "CreateUniqueLayer" (settingsData.createUniqueLayer as string)
+            setINISetting temporaryIniPath "Interface" "NeverShowOrientationPanel" (settingsData.neverShowOrientationPanel as string)
             setINISetting temporaryIniPath "Window" "X" (settingsData.windowX as string)
             setINISetting temporaryIniPath "Window" "Y" (settingsData.windowY as string)
             (dotNetClass "System.IO.File").Copy temporaryIniPath iniFilePath true
@@ -271,6 +282,17 @@ struct DropperAppManager (
         return true
     ),
 
+    fn restartIdlePromotionTimer = (
+        if (idlePromotionTimer == undefined) do return false
+        try (
+            idlePromotionTimer.Stop()
+            idlePromotionTimer.Start()
+            return true
+        ) catch (
+            return false
+        )
+    ),
+
     fn addLog messageContent severityLevel:0 = (
         local severityPrefix = case severityLevel of (
             1: "[SUCCESS] "
@@ -294,6 +316,7 @@ struct DropperAppManager (
     ),
 
     fn setStatus messageContent = (
+        restartIdlePromotionTimer()
         statusLinkUrl = ""
         if (statusLabel != undefined) do (
             statusLabel.Text = messageContent
@@ -309,11 +332,31 @@ struct DropperAppManager (
     fn getRandomPromotionData = (
         local promotionIndex = random 1 4
         case promotionIndex of (
-            1: return #("Donate to support Dropper", "https://store.payproglobal.com/checkout?products[1][id]=137852")
+            1: return #("Donate", "https://store.payproglobal.com/checkout?products[1][id]=137852")
             2: return #("Visit maxpkg.dev", "https://maxpkg.dev")
             3: return #("Visit 3dground.net", "https://3dground.net")
             4: return #("More scripts on maxpkg.dev", "https://maxpkg.dev")
         )
+    ),
+
+    fn addPromotionLog promotionData = (
+        if (logBox == undefined or promotionData == undefined or promotionData.count < 2) do return false
+        logBox.SelectionStart = logBox.TextLength
+        logBox.SelectionLength = 0
+        logBox.SelectionColor = getLogColor 0
+        logBox.SelectionFont = logBox.Font
+        logBox.AppendText "[INFO] "
+        local linkStart = logBox.TextLength
+        logBox.SelectionColor = themeAccentColor()
+        logBox.SelectionFont = dotNetObject "System.Drawing.Font" logBox.Font (dotNetClass "System.Drawing.FontStyle").Underline
+        logBox.AppendText promotionData[1]
+        append logPromotionLinks #(linkStart, promotionData[1].count, promotionData[2])
+        logBox.SelectionColor = getLogColor 0
+        logBox.SelectionFont = logBox.Font
+        logBox.AppendText "\r\n"
+        logBox.SelectionStart = logBox.TextLength
+        logBox.ScrollToCaret()
+        return true
     ),
 
     fn showRandomStatusPromotion prefixContent:"" = (
@@ -326,20 +369,55 @@ struct DropperAppManager (
         statusLabel.SelectionFont = dotNetObject "System.Drawing.Font" statusLabel.Font (dotNetClass "System.Drawing.FontStyle").Underline
         statusLabel.Select 0 0
         statusLabel.Cursor = (dotNetClass "System.Windows.Forms.Cursors").Hand
+        restartIdlePromotionTimer()
+        return true
+    ),
+
+    fn onIdlePromotionTimerTick senderObject eventArgs = (
+        if (not isBusy) do showRandomStatusPromotion()
+        return true
+    ),
+
+    fn onLogPromotionTimerTick senderObject eventArgs = (
+        local promotionData = getRandomPromotionData()
+        addPromotionLog promotionData
         return true
     ),
 
     fn onStatusLinkClick senderObject eventArgs = (
+        restartIdlePromotionTimer()
         if (statusLinkUrl == "") do return false
         ShellLaunch statusLinkUrl ""
         return true
     ),
 
     fn onLogLinkClicked senderObject linkClickedArgs = (
+        restartIdlePromotionTimer()
         local clickedAddress = linkClickedArgs.LinkText as string
         if (clickedAddress == "") do return false
-        ShellLaunch clickedAddress ""
+        local resolvedAddress = clickedAddress
+        for promotionIndex = 1 to 4 while (resolvedAddress == clickedAddress) do (
+            local promotionData = case promotionIndex of (
+                1: #("Donate", "https://store.payproglobal.com/checkout?products[1][id]=137852")
+                2: #("Visit maxpkg.dev", "https://maxpkg.dev")
+                3: #("Visit 3dground.net", "https://3dground.net")
+                4: #("More scripts on maxpkg.dev", "https://maxpkg.dev")
+            )
+            if (clickedAddress == promotionData[1]) do resolvedAddress = promotionData[2]
+        )
+        ShellLaunch resolvedAddress ""
         return true
+    ),
+
+    fn onLogMouseUp senderObject mouseEventArgs = (
+        local characterIndex = senderObject.GetCharIndexFromPosition mouseEventArgs.Location
+        for promotionLink in logPromotionLinks do (
+            if (characterIndex >= promotionLink[1] and characterIndex < (promotionLink[1] + promotionLink[2])) do (
+                ShellLaunch promotionLink[3] ""
+                return true
+            )
+        )
+        return false
     ),
 
     fn isMainFormVisible = (
@@ -378,19 +456,21 @@ struct DropperAppManager (
     ),
 
     fn toggleLog = (
-        if (mainForm == undefined or logBox == undefined) do return false
+        if (mainForm == undefined or logBox == undefined or logBorderPanel == undefined) do return false
         isLogVisible = not isLogVisible
-        logBox.Visible = isLogVisible
+        logBorderPanel.Visible = isLogVisible
         mainForm.ClientSize = dotNetObject "System.Drawing.Size" 330 (if isLogVisible then 440 else 160)
         updateLogButton()
         return true
     ),
 
     fn onToggleLog senderObject eventArgs = (
+        restartIdlePromotionTimer()
         toggleLog()
     ),
 
     fn onDropPanelDragEnter senderObject dragEventArgs = (
+        restartIdlePromotionTimer()
         local dataFormatsClass = dotNetClass "System.Windows.Forms.DataFormats"
         if (dragEventArgs.Data.GetDataPresent dataFormatsClass.FileDrop) then (
             dragEventArgs.Effect = (dotNetClass "System.Windows.Forms.DragDropEffects").Copy
@@ -408,13 +488,203 @@ struct DropperAppManager (
             deferredDropTimer = undefined
             deferredDropFilePaths = #()
         )
+        if (updateCheckTimer != undefined) do (
+            try (updateCheckTimer.Stop()) catch()
+            try (updateCheckTimer.Dispose()) catch()
+            updateCheckTimer = undefined
+        )
+        if (idlePromotionTimer != undefined) do (
+            try (idlePromotionTimer.Stop()) catch()
+            try (idlePromotionTimer.Dispose()) catch()
+            idlePromotionTimer = undefined
+        )
+        if (logPromotionTimer != undefined) do (
+            try (logPromotionTimer.Stop()) catch()
+            try (logPromotionTimer.Dispose()) catch()
+            logPromotionTimer = undefined
+        )
         if (helpForm != undefined) do try (helpForm.Close()) catch()
         if (settingsForm != undefined) do try (settingsForm.Close()) catch()
+        if (orientationForm != undefined) do try (orientationForm.Close()) catch()
         if (dropPanelImage != undefined) do (
             try (dropPanelImage.Dispose()) catch()
             dropPanelImage = undefined
         )
         enableAccelerators = true
+    ),
+
+    fn positionOrientationForm = (
+        if (mainForm == undefined or orientationForm == undefined) do return false
+        try (
+            if (mainForm.IsDisposed or orientationForm.IsDisposed) do return false
+            local clientTopLeft = mainForm.PointToScreen (dotNetObject "System.Drawing.Point" 0 0)
+            orientationForm.Location = dotNetObject "System.Drawing.Point" (mainForm.Right - 6) clientTopLeft.Y
+            return true
+        ) catch (
+            return false
+        )
+    ),
+
+    fn onMainFormLocationChanged senderObject eventArgs = (
+        positionOrientationForm()
+        return true
+    ),
+
+    fn onOrientationFormClosed senderObject eventArgs = (
+        if (orientationCloseImage != undefined) do try (orientationCloseImage.Dispose()) catch()
+        orientationCloseImage = undefined
+        orientationForm = undefined
+        return true
+    ),
+
+    fn setExactEulerRotation sceneNode xAngle yAngle zAngle = (
+        try (
+            if (classOf sceneNode.rotation.controller != Euler_XYZ) do (
+                sceneNode.rotation.controller = Euler_XYZ()
+            )
+            sceneNode.rotation.controller.x_rotation = xAngle
+            sceneNode.rotation.controller.y_rotation = yAngle
+            sceneNode.rotation.controller.z_rotation = zAngle
+            return true
+        ) catch (
+            sceneNode.rotation = eulerAngles xAngle yAngle zAngle
+            return false
+        )
+    ),
+
+    fn hasSelectedAncestor sceneNode selectedNodes = (
+        local ancestorNode = sceneNode.parent
+        while (ancestorNode != undefined) do (
+            if ((findItem selectedNodes ancestorNode) > 0) do return true
+            ancestorNode = ancestorNode.parent
+        )
+        return false
+    ),
+
+    fn orientSelectedObjects orientationType = (
+        restartIdlePromotionTimer()
+        if (selection.count == 0) do (
+            setStatus "Select one or more objects"
+            return false
+        )
+        local targetAngles = case orientationType of (
+            #front: #(90.0, 0.0, 0.0)
+            #left: #(-90.0, -180.0, 90.0)
+            #top: #(0.0, 0.0, 0.0)
+            default: undefined
+        )
+        if (targetAngles == undefined) do return false
+        local selectedNodes = selection as array
+        if (selectedNodes.count == 1) do (
+            undo "Orient Dropper selection" on (
+                setExactEulerRotation selectedNodes[1] targetAngles[1] targetAngles[2] targetAngles[3]
+            )
+            try (max tool zoomextents all) catch()
+            redrawViews()
+            return true
+        )
+        local originalTransforms = for sceneNode in selectedNodes collect sceneNode.transform
+        local collectiveCenter = [0, 0, 0]
+        for originalTransform in originalTransforms do collectiveCenter += originalTransform.row4
+        collectiveCenter /= originalTransforms.count
+        local currentRotationMatrix = selectedNodes[1].transform.rotationPart as matrix3
+        local targetRotationMatrix = case orientationType of (
+            #front: matrix3 [1, 0, 0] [0, 0, 1] [0, -1, 0] [0, 0, 0]
+            #left: matrix3 [0, -1, 0] [0, 0, 1] [-1, 0, 0] [0, 0, 0]
+            #top: matrix3 [1, 0, 0] [0, 1, 0] [0, 0, 1] [0, 0, 0]
+        )
+        local deltaRotationMatrix = (inverse currentRotationMatrix) * targetRotationMatrix
+        local pivotDeltaMatrix = (transMatrix (-collectiveCenter)) * deltaRotationMatrix * (transMatrix collectiveCenter)
+        undo "Orient Dropper selection" on (
+            for nodeIndex = 1 to selectedNodes.count do (
+                if (not hasSelectedAncestor selectedNodes[nodeIndex] selectedNodes) do (
+                    selectedNodes[nodeIndex].transform = originalTransforms[nodeIndex] * pivotDeltaMatrix
+                )
+            )
+            select selectedNodes
+        )
+        try (max tool zoomextents all) catch()
+        redrawViews()
+        return true
+    ),
+
+    fn onOrientFront senderObject eventArgs = (return orientSelectedObjects #front),
+    fn onOrientLeft senderObject eventArgs = (return orientSelectedObjects #left),
+    fn onOrientTop senderObject eventArgs = (return orientSelectedObjects #top),
+
+    fn onCloseOrientationForm senderObject eventArgs = (
+        if (orientationForm != undefined) do orientationForm.Close()
+        return true
+    ),
+
+    fn showOrientationForm = (
+        if (orientationForm != undefined) do try (orientationForm.Close()) catch()
+        orientationForm = dotNetObject "System.Windows.Forms.Form"
+        orientationForm.Text = "Dropper Views"
+        orientationForm.AutoScaleMode = (dotNetClass "System.Windows.Forms.AutoScaleMode").None
+        orientationForm.FormBorderStyle = (dotNetClass "System.Windows.Forms.FormBorderStyle").None
+        orientationForm.ClientSize = dotNetObject "System.Drawing.Size" 74 132
+        orientationForm.MinimumSize = dotNetObject "System.Drawing.Size" 74 132
+        orientationForm.MaximumSize = dotNetObject "System.Drawing.Size" 74 132
+        orientationForm.ShowInTaskbar = false
+        orientationForm.TopMost = true
+        orientationForm.StartPosition = (dotNetClass "System.Windows.Forms.FormStartPosition").Manual
+        applyFormTheme orientationForm
+
+        local closeOrientationButton = dotNetObject "System.Windows.Forms.Button"
+        closeOrientationButton.Text = ""
+        closeOrientationButton.Location = dotNetObject "System.Drawing.Point" 50 4
+        closeOrientationButton.Size = dotNetObject "System.Drawing.Size" 20 20
+        closeOrientationButton.TabStop = false
+        closeOrientationButton.Padding = dotNetObject "System.Windows.Forms.Padding" 0 0 0 0
+        closeOrientationButton.Margin = dotNetObject "System.Windows.Forms.Padding" 0 0 0 0
+        closeOrientationButton.TextImageRelation = (dotNetClass "System.Windows.Forms.TextImageRelation").Overlay
+        applyButtonTheme closeOrientationButton
+        local closeIconPath = scriptFolderPath + "assets\\lucide-x.png"
+        if ((dotNetClass "System.IO.File").Exists closeIconPath) do (
+            local sourceCloseImage = undefined
+            try (
+                sourceCloseImage = (dotNetClass "System.Drawing.Image").FromFile closeIconPath
+                orientationCloseImage = dotNetObject "System.Drawing.Bitmap" sourceCloseImage
+                closeOrientationButton.Image = orientationCloseImage
+                closeOrientationButton.ImageAlign = (dotNetClass "System.Drawing.ContentAlignment").MiddleCenter
+            ) catch (
+                orientationCloseImage = undefined
+            )
+            if (sourceCloseImage != undefined) do try (sourceCloseImage.Dispose()) catch()
+        )
+        orientationForm.Controls.Add closeOrientationButton
+
+        local frontButton = dotNetObject "System.Windows.Forms.Button"
+        frontButton.Text = "Front"
+        frontButton.Location = dotNetObject "System.Drawing.Point" 4 30
+        frontButton.Size = dotNetObject "System.Drawing.Size" 66 30
+        applyButtonTheme frontButton
+        orientationForm.Controls.Add frontButton
+
+        local leftButton = dotNetObject "System.Windows.Forms.Button"
+        leftButton.Text = "Left"
+        leftButton.Location = dotNetObject "System.Drawing.Point" 4 64
+        leftButton.Size = dotNetObject "System.Drawing.Size" 66 30
+        applyButtonTheme leftButton
+        orientationForm.Controls.Add leftButton
+
+        local topButton = dotNetObject "System.Windows.Forms.Button"
+        topButton.Text = "Top"
+        topButton.Location = dotNetObject "System.Drawing.Point" 4 98
+        topButton.Size = dotNetObject "System.Drawing.Size" 66 30
+        applyButtonTheme topButton
+        orientationForm.Controls.Add topButton
+
+        dotNet.addEventHandler closeOrientationButton "Click" onCloseOrientationForm
+        dotNet.addEventHandler frontButton "Click" onOrientFront
+        dotNet.addEventHandler leftButton "Click" onOrientLeft
+        dotNet.addEventHandler topButton "Click" onOrientTop
+        dotNet.addEventHandler orientationForm "FormClosed" onOrientationFormClosed
+        orientationForm.Show mainForm
+        orientationForm.ClientSize = dotNetObject "System.Drawing.Size" 74 132
+        positionOrientationForm()
+        return true
     ),
 
     fn openWebAddress webAddress = (		
@@ -425,6 +695,151 @@ struct DropperAppManager (
     fn onOpen3DGround senderObject eventArgs = (return openWebAddress "https://3dground.net"),
     fn onOpenMaxPkg senderObject eventArgs = (return openWebAddress "https://maxpkg.dev"),
     fn onDonate senderObject eventArgs = (return openWebAddress "https://store.payproglobal.com/checkout?products[1][id]=137852"),
+
+    fn getVersionParts versionText = (
+        local cleanedVersion = toLower (versionText as string)
+        if (cleanedVersion.count > 0 and substring cleanedVersion 1 1 == "v") do (
+            cleanedVersion = substring cleanedVersion 2 (cleanedVersion.count - 1)
+        )
+        local rawParts = filterString cleanedVersion ".-+_"
+        local versionParts = #(0, 0, 0, 0)
+        for partIndex = 1 to (amin rawParts.count versionParts.count) do (
+            try (versionParts[partIndex] = rawParts[partIndex] as integer) catch (versionParts[partIndex] = 0)
+        )
+        return versionParts
+    ),
+
+    fn isNewerVersion candidateVersion currentVersion = (
+        local candidateParts = getVersionParts candidateVersion
+        local currentParts = getVersionParts currentVersion
+        for partIndex = 1 to candidateParts.count do (
+            if (candidateParts[partIndex] > currentParts[partIndex]) do return true
+            if (candidateParts[partIndex] < currentParts[partIndex]) do return false
+        )
+        return false
+    ),
+
+    fn getGithubReleaseValue responseText propertyName valuePattern = (
+        local regexClass = dotNetClass "System.Text.RegularExpressions.Regex"
+        local regexOptions = dotNetClass "System.Text.RegularExpressions.RegexOptions"
+        local propertyPattern = "\"" + propertyName + "\"\\s*:\\s*\"(" + valuePattern + ")\""
+        local matchData = regexClass.Match responseText propertyPattern regexOptions.IgnoreCase
+        if (not matchData.Success) do return ""
+        return matchData.Groups.Item[1].Value
+    ),
+
+    fn fileIsNonEmpty filePath = (
+        if (not (dotNetClass "System.IO.File").Exists filePath) do return false
+        try (return ((dotNetObject "System.IO.FileInfo" filePath).Length > 0)) catch (return false)
+    ),
+
+    fn downloadUpdateWithCurl sourceUrl destinationPath = (
+        try (
+            local processInfo = dotNetObject "System.Diagnostics.ProcessStartInfo"
+            processInfo.FileName = "curl.exe"
+            processInfo.Arguments = "--location --fail --silent --show-error --output \"" + destinationPath + "\" \"" + sourceUrl + "\""
+            processInfo.UseShellExecute = false
+            processInfo.CreateNoWindow = true
+            local curlProcess = dotNetObject "System.Diagnostics.Process"
+            curlProcess.StartInfo = processInfo
+            if (not curlProcess.Start()) do return false
+            curlProcess.WaitForExit()
+            local curlSucceeded = curlProcess.ExitCode == 0 and fileIsNonEmpty destinationPath
+            curlProcess.Dispose()
+            return curlSucceeded
+        ) catch (
+            return false
+        )
+    ),
+
+    fn downloadUpdatePackage sourceUrl destinationPath = (
+        try (
+            if ((dotNetClass "System.IO.File").Exists destinationPath) do (dotNetClass "System.IO.File").Delete destinationPath
+            local webClient = dotNetObject "System.Net.WebClient"
+            webClient.Headers.Add "User-Agent" "Dropper-3dsMax"
+            webClient.DownloadFile sourceUrl destinationPath
+            if (fileIsNonEmpty destinationPath) do return true
+        ) catch()
+        try (if ((dotNetClass "System.IO.File").Exists destinationPath) do (dotNetClass "System.IO.File").Delete destinationPath) catch()
+        return downloadUpdateWithCurl sourceUrl destinationPath
+    ),
+
+    fn copyExtractedUpdate stagingFolderPath = (
+        local manifestPath = (dotNetClass "System.IO.Path").Combine stagingFolderPath "manifest.ini"
+        if (not (dotNetClass "System.IO.File").Exists manifestPath) do return false
+        if ((toLower (getINISetting manifestPath "package" "packageGuid")) != "647fbcec-f70e-4305-92df-4f545e13354b") do return false
+        local packageVersion = getINISetting manifestPath "package" "version"
+        if (not isNewerVersion packageVersion versionContent) do return false
+
+        local searchOption = (dotNetClass "System.IO.SearchOption").AllDirectories
+        local extractedFiles = (dotNetClass "System.IO.Directory").GetFiles stagingFolderPath "*" searchOption
+        local excludedNames = #("mzp.run", "mzp.run.ms", "_install.ms", "_uninstall.ms", "Dropper.ini")
+        for sourceFilePath in extractedFiles do (
+            local relativePath = substring sourceFilePath (stagingFolderPath.count + 2) -1
+            local fileNameLower = toLower ((dotNetClass "System.IO.Path").GetFileName sourceFilePath)
+            if ((findItem excludedNames fileNameLower) == 0) do (
+                local destinationPath = (dotNetClass "System.IO.Path").Combine scriptFolderPath relativePath
+                local destinationFolder = (dotNetClass "System.IO.Path").GetDirectoryName destinationPath
+                if (not (dotNetClass "System.IO.Directory").Exists destinationFolder) do (
+                    (dotNetClass "System.IO.Directory").CreateDirectory destinationFolder
+                )
+                (dotNetClass "System.IO.File").Copy sourceFilePath destinationPath true
+            )
+        )
+        return true
+    ),
+
+    fn checkForGithubUpdate = (
+        local latestReleaseApiUrl = "https://api.github.com/repos/maxpkg-dev/Dropper/releases/latest"
+        local updateFilePath = ""
+        local stagingFolderPath = ""
+        try (
+            local servicePointManagerClass = dotNetClass "System.Net.ServicePointManager"
+            local securityProtocolClass = dotNetClass "System.Net.SecurityProtocolType"
+            servicePointManagerClass.SecurityProtocol = securityProtocolClass.Tls12
+
+            local webClient = dotNetObject "System.Net.WebClient"
+            webClient.Headers.Add "User-Agent" "Dropper-3dsMax"
+            webClient.Headers.Add "Accept" "application/vnd.github+json"
+            local responseText = webClient.DownloadString latestReleaseApiUrl
+            local latestVersion = getGithubReleaseValue responseText "tag_name" "[^\"]+"
+            local packageUrl = getGithubReleaseValue responseText "browser_download_url" "[^\"]+\\.mzp"
+
+            if (latestVersion == "") do throw "The latest release does not contain a version tag."
+            if (not isNewerVersion latestVersion versionContent) do return true
+
+            if (packageUrl == "") do throw "The latest release does not contain an MZP package."
+            local tempFolderPath = (dotNetClass "System.IO.Path").GetTempPath()
+            local updateId = createGuidString()
+            updateFilePath = (dotNetClass "System.IO.Path").Combine tempFolderPath ("Dropper-" + updateId + ".mzp")
+            stagingFolderPath = (dotNetClass "System.IO.Path").Combine tempFolderPath ("DropperUpdate-" + updateId)
+            if (not downloadUpdatePackage packageUrl updateFilePath) do throw "The update package could not be downloaded."
+
+            (dotNetClass "System.IO.Directory").CreateDirectory stagingFolderPath
+            dotNet.loadAssembly "System.IO.Compression.FileSystem"
+            (dotNetClass "System.IO.Compression.ZipFile").ExtractToDirectory updateFilePath stagingFolderPath
+            if (not copyExtractedUpdate stagingFolderPath) do throw "The update package did not pass validation."
+
+            local restartEntryPath = scriptFolderPath + "Dropper.ms"
+            if (mainForm != undefined) do mainForm.Close()
+            fileIn restartEntryPath
+            try ((dotNetClass "System.IO.Directory").Delete stagingFolderPath true) catch()
+            try ((dotNetClass "System.IO.File").Delete updateFilePath) catch()
+            return true
+        ) catch (
+            try (if (stagingFolderPath != "" and (dotNetClass "System.IO.Directory").Exists stagingFolderPath) do (dotNetClass "System.IO.Directory").Delete stagingFolderPath true) catch()
+            try (if (updateFilePath != "" and (dotNetClass "System.IO.File").Exists updateFilePath) do (dotNetClass "System.IO.File").Delete updateFilePath) catch()
+            return false
+        )
+    ),
+
+    fn onAutomaticUpdateTimerTick senderObject eventArgs = (
+        senderObject.Stop()
+        senderObject.Dispose()
+        updateCheckTimer = undefined
+        checkForGithubUpdate()
+        return true
+    ),
 
     fn onHelpFormClosed senderObject eventArgs = (
         helpForm = undefined
@@ -500,6 +915,7 @@ struct DropperAppManager (
     ),
 
     fn onHelpButtonClick senderObject eventArgs = (
+        restartIdlePromotionTimer()
         return showHelpForm()
     ),
 
@@ -512,6 +928,7 @@ struct DropperAppManager (
         settingsData.renameDuplicateNodes = settingsRenameNodesCheck.Checked
         settingsData.renameDuplicateMaterials = settingsRenameMaterialsCheck.Checked
         settingsData.createUniqueLayer = settingsUniqueLayerCheck.Checked
+        settingsData.neverShowOrientationPanel = settingsOrientationPanelCheck.Checked
         if (not saveSettings()) do (
             messageBox ("Dropper could not save settings next to:\n" + entryFilePath) title:"Dropper"
             return false
@@ -520,6 +937,7 @@ struct DropperAppManager (
     ),
 
     fn onSettingsSameFolderChanged senderObject eventArgs = (
+        restartIdlePromotionTimer()
         local areCustomFolderControlsEnabled = not settingsExtractNextCheck.Checked
         settingsExtractFolderBox.ReadOnly = not areCustomFolderControlsEnabled
         settingsExtractFolderBox.BackColor = if areCustomFolderControlsEnabled then themeInputColor() else themeSurfaceColor()
@@ -528,10 +946,23 @@ struct DropperAppManager (
     ),
 
     fn onSettingsValueChanged senderObject eventArgs = (
+        restartIdlePromotionTimer()
+        return saveSettingsFromControls()
+    ),
+
+    fn onSettingsOrientationPanelChanged senderObject eventArgs = (
+        restartIdlePromotionTimer()
+        settingsData.neverShowOrientationPanel = settingsOrientationPanelCheck.Checked
+        if (settingsData.neverShowOrientationPanel) then (
+            if (orientationForm != undefined) do orientationForm.Close()
+        ) else (
+            if (orientationForm == undefined) do showOrientationForm()
+        )
         return saveSettingsFromControls()
     ),
 
     fn onSettingsTextLeave senderObject eventArgs = (
+        restartIdlePromotionTimer()
         return saveSettingsFromControls()
     ),
 
@@ -556,6 +987,7 @@ struct DropperAppManager (
     ),
 
     fn onSettingsBrowseExtract senderObject eventArgs = (
+        restartIdlePromotionTimer()
         local selectedFolderPath = chooseFolderWithExplorerDialog settingsExtractFolderBox.Text
         if (selectedFolderPath != undefined and selectedFolderPath != "") do (
             settingsExtractFolderBox.Text = selectedFolderPath
@@ -565,6 +997,7 @@ struct DropperAppManager (
     ),
 
     fn onSettingsBrowseRar senderObject eventArgs = (
+        restartIdlePromotionTimer()
         local fileDialog = dotNetObject "System.Windows.Forms.OpenFileDialog"
         fileDialog.Title = "Choose a RAR-compatible executable"
         fileDialog.Filter = "Executables|*.exe|All files|*.*"
@@ -606,7 +1039,7 @@ struct DropperAppManager (
         settingsForm = dotNetObject "System.Windows.Forms.Form"
         settingsForm.Text = "Dropper Settings"
         settingsForm.FormBorderStyle = (dotNetClass "System.Windows.Forms.FormBorderStyle").FixedToolWindow
-        settingsForm.ClientSize = dotNetObject "System.Drawing.Size" 420 506
+        settingsForm.ClientSize = dotNetObject "System.Drawing.Size" 420 532
         settingsForm.MaximizeBox = false
         settingsForm.MinimizeBox = false
         settingsForm.ShowInTaskbar = false
@@ -677,7 +1110,7 @@ struct DropperAppManager (
         local importGroup = dotNetObject "System.Windows.Forms.GroupBox"
         importGroup.Text = "Import"
         importGroup.Location = dotNetObject "System.Drawing.Point" 10 168
-        importGroup.Size = dotNetObject "System.Drawing.Size" 400 58
+        importGroup.Size = dotNetObject "System.Drawing.Size" 400 84
         applyGroupTheme importGroup
         settingsForm.Controls.Add importGroup
 
@@ -689,9 +1122,17 @@ struct DropperAppManager (
         applyCheckBoxTheme settingsImporterDialogsCheck
         importGroup.Controls.Add settingsImporterDialogsCheck
 
+        settingsOrientationPanelCheck = dotNetObject "System.Windows.Forms.CheckBox"
+        settingsOrientationPanelCheck.Text = "Never show Front / Left / Top panel"
+        settingsOrientationPanelCheck.Location = dotNetObject "System.Drawing.Point" 12 48
+        settingsOrientationPanelCheck.Size = dotNetObject "System.Drawing.Size" 320 24
+        settingsOrientationPanelCheck.Checked = settingsData.neverShowOrientationPanel
+        applyCheckBoxTheme settingsOrientationPanelCheck
+        importGroup.Controls.Add settingsOrientationPanelCheck
+
         local safeMergeGroup = dotNetObject "System.Windows.Forms.GroupBox"
         safeMergeGroup.Text = "Safe merge"
-        safeMergeGroup.Location = dotNetObject "System.Drawing.Point" 10 234
+        safeMergeGroup.Location = dotNetObject "System.Drawing.Point" 10 260
         safeMergeGroup.Size = dotNetObject "System.Drawing.Size" 400 102
         applyGroupTheme safeMergeGroup
         settingsForm.Controls.Add safeMergeGroup
@@ -722,7 +1163,7 @@ struct DropperAppManager (
 
         local aboutGroup = dotNetObject "System.Windows.Forms.GroupBox"
         aboutGroup.Text = "About"
-        aboutGroup.Location = dotNetObject "System.Drawing.Point" 10 344
+        aboutGroup.Location = dotNetObject "System.Drawing.Point" 10 370
         aboutGroup.Size = dotNetObject "System.Drawing.Size" 400 152
         applyGroupTheme aboutGroup
         settingsForm.Controls.Add aboutGroup
@@ -759,6 +1200,8 @@ struct DropperAppManager (
         dotNet.addEventHandler settingsRarExecutableBox "Leave" onSettingsTextLeave
         dotNet.addEventHandler settingsImporterDialogsCheck "CheckedChanged" onSettingsValueChanged
         dotNet.addEventHandler settingsImporterDialogsCheck "CheckedChanged" onThemedCheckStateChanged
+        dotNet.addEventHandler settingsOrientationPanelCheck "CheckedChanged" onSettingsOrientationPanelChanged
+        dotNet.addEventHandler settingsOrientationPanelCheck "CheckedChanged" onThemedCheckStateChanged
         dotNet.addEventHandler settingsRenameNodesCheck "CheckedChanged" onSettingsValueChanged
         dotNet.addEventHandler settingsRenameNodesCheck "CheckedChanged" onThemedCheckStateChanged
         dotNet.addEventHandler settingsRenameMaterialsCheck "CheckedChanged" onSettingsValueChanged
@@ -778,6 +1221,7 @@ struct DropperAppManager (
     ),
 
     fn onSettingsButtonClick senderObject eventArgs = (
+        restartIdlePromotionTimer()
         return showSettingsForm()
     ),
 
@@ -1263,7 +1707,7 @@ struct DropperAppManager (
             local planeWidth = imageData[2]
             local planeHeight = imageData[3]
             local planeNode = plane width:planeWidth length:planeHeight widthsegs:1 lengthsegs:1 mapcoords:true
-            planeNode.rotation = eulerAngles 90 0 0
+            planeNode.rotation = eulerAngles -90 0 0
             planeNode.pos = [currentX + planeWidth * 0.5, 0, planeHeight * 0.5]
             planeNode.name = uniqueName ("DROP_" + (dotNetClass "System.IO.Path").GetFileNameWithoutExtension imageFilePath + "_")
             local bitmapMap = bitmapTexture filename:imageFilePath
@@ -1278,7 +1722,13 @@ struct DropperAppManager (
             currentX += planeWidth + spacingSize
         )
         if (settingsData.createUniqueLayer) do assignNodesToUniqueLayer createdPlanes imageFilePaths[1]
-        try (select createdPlanes; max tool zoomextents) catch (addLog "Viewport zoom could not be completed." severityLevel:2)
+        try (
+            select createdPlanes
+            max tool zoomextents all
+        ) catch (
+            try (select createdPlanes; max tool zoomextents) catch (addLog "Viewport zoom could not be completed." severityLevel:2)
+        )
+        if (not settingsData.neverShowOrientationPanel and orientationForm == undefined) do showOrientationForm()
         redrawViews()
         addLog ("Created " + (createdPlanes.count as string) + " image plane(s).") severityLevel:1
         return true
@@ -1693,17 +2143,19 @@ struct DropperAppManager (
         deferredDropTimer.Start()
         setStatus ("Queued " + (sourceFilePaths.count as string) + " file(s)")
         local logPromotionData = getRandomPromotionData()
-        addLog (logPromotionData[1] + ": " + logPromotionData[2])
+        addPromotionLog logPromotionData
         return true
     ),
 
     fn onDropPanelDragDrop senderObject dragEventArgs = (
+        restartIdlePromotionTimer()
         local dataFormatsClass = dotNetClass "System.Windows.Forms.DataFormats"
         local droppedFiles = dragEventArgs.Data.GetData dataFormatsClass.FileDrop
         return queueDroppedFiles droppedFiles
     ),
 
     fn onDropPanelClick senderObject eventArgs = (
+        restartIdlePromotionTimer()
         local fileDialog = dotNetObject "System.Windows.Forms.OpenFileDialog"
         fileDialog.Title = "Select files for Dropper"
         fileDialog.Multiselect = true
@@ -1790,9 +2242,16 @@ struct DropperAppManager (
         applyButtonTheme logButton
         mainForm.Controls.Add logButton
 
+        logBorderPanel = dotNetObject "System.Windows.Forms.Panel"
+        logBorderPanel.Location = dotNetObject "System.Drawing.Point" 10 166
+        logBorderPanel.Size = dotNetObject "System.Drawing.Size" 310 264
+        logBorderPanel.BackColor = themeInputBorderColor()
+        logBorderPanel.Visible = false
+        mainForm.Controls.Add logBorderPanel
+
         logBox = dotNetObject "System.Windows.Forms.RichTextBox"
-        logBox.Location = dotNetObject "System.Drawing.Point" 10 166
-        logBox.Size = dotNetObject "System.Drawing.Size" 310 264
+        logBox.Location = dotNetObject "System.Drawing.Point" 1 1
+        logBox.Size = dotNetObject "System.Drawing.Size" 308 262
         logBox.ReadOnly = true
         logBox.Multiline = true
         logBox.WordWrap = false
@@ -1800,9 +2259,9 @@ struct DropperAppManager (
         logBox.ScrollBars = (dotNetClass "System.Windows.Forms.RichTextBoxScrollBars").Both
         logBox.BackColor = themeInputColor()
         logBox.ForeColor = themeTextColor()
-        logBox.BorderStyle = (dotNetClass "System.Windows.Forms.BorderStyle").FixedSingle
-        logBox.Visible = false
-        mainForm.Controls.Add logBox
+        logBox.BorderStyle = (dotNetClass "System.Windows.Forms.BorderStyle").None
+        logBox.Visible = true
+        logBorderPanel.Controls.Add logBox
 
         dotNet.addEventHandler dropPanel "DragEnter" onDropPanelDragEnter
         dotNet.addEventHandler dropPanel "DragDrop" onDropPanelDragDrop
@@ -1812,7 +2271,9 @@ struct DropperAppManager (
         dotNet.addEventHandler logButton "Click" onToggleLog
         dotNet.addEventHandler statusLabel "Click" onStatusLinkClick
         dotNet.addEventHandler logBox "LinkClicked" onLogLinkClicked
+        dotNet.addEventHandler logBox "MouseUp" onLogMouseUp
         dotNet.addEventHandler mainForm "FormClosing" onMainFormClosing
+        dotNet.addEventHandler mainForm "LocationChanged" onMainFormLocationChanged
 
         restoreWindowPosition()
         return true
@@ -1830,6 +2291,18 @@ struct DropperAppManager (
         if (not canWriteSettingsFolder()) do (
             addLog ("Settings folder is not writable: " + scriptFolderPath) severityLevel:3
         )
+        updateCheckTimer = dotNetObject "System.Windows.Forms.Timer"
+        updateCheckTimer.Interval = 1200
+        dotNet.addEventHandler updateCheckTimer "Tick" onAutomaticUpdateTimerTick
+        updateCheckTimer.Start()
+        idlePromotionTimer = dotNetObject "System.Windows.Forms.Timer"
+        idlePromotionTimer.Interval = 20000
+        dotNet.addEventHandler idlePromotionTimer "Tick" onIdlePromotionTimerTick
+        idlePromotionTimer.Start()
+        logPromotionTimer = dotNetObject "System.Windows.Forms.Timer"
+        logPromotionTimer.Interval = 60000
+        dotNet.addEventHandler logPromotionTimer "Tick" onLogPromotionTimerTick
+        logPromotionTimer.Start()
         return true
     ),
 
@@ -1857,13 +2330,12 @@ try (
     if (dropperApp != undefined) do (
         try (isDropperAlreadyOpen = dropperApp.isMainFormVisible()) catch (isDropperAlreadyOpen = false)
     )
-    if (isDropperAlreadyOpen) then (
-        dropperApp.mainForm.Activate()
-    ) else (
-        local dropperEntryFilePath = getThisScriptFileName()
-        dropperApp = DropperAppManager()
-        dropperApp.initialize dropperEntryFilePath
+    if (isDropperAlreadyOpen) do (
+        try (dropperApp.mainForm.Close()) catch()
     )
+    local dropperEntryFilePath = getThisScriptFileName()
+    dropperApp = DropperAppManager()
+    dropperApp.initialize dropperEntryFilePath
 ) catch (
     messageBox ("Dropper could not start:\n" + (getCurrentException() as string)) title:"Dropper"
 )
