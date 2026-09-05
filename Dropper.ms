@@ -1,6 +1,7 @@
 /*
     Dropper
     Drag archives, 3D files, and bitmap images into a compact 3ds Max toolbox.
+    Package version comes from MaxPkg metadata; editable source runs never self-update.
 */
 
 global dropperApp
