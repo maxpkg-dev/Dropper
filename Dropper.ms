@@ -343,12 +343,16 @@ struct DropperAppManager (
     ),
 
     fn getRandomPromotionData = (
-        local promotionIndex = random 1 4
+        local promotionIndex = random 1 8
         case promotionIndex of (
             1: return #("Donate", "https://store.payproglobal.com/checkout?products[1][id]=137852")
             2: return #("Visit maxpkg.dev", "https://maxpkg.dev")
             3: return #("Visit 3dground.net", "https://3dground.net")
             4: return #("More scripts on maxpkg.dev", "https://maxpkg.dev")
+            5: return #("Support 3DGROUND on Patreon", "https://www.patreon.com/3dground")
+            6: return #("Try Prune Scene", "https://3dground.net/en/prod/prune-scene-2180817")
+            7: return #("Try Model Packer", "https://3dground.net/en/prod/model-packer-3091668")
+            8: return #("Try CopyTo Pro", "https://3dground.net/en/prod/copyto-pro-3201577")
         )
     ),
 
@@ -409,12 +413,16 @@ struct DropperAppManager (
         local clickedAddress = linkClickedArgs.LinkText as string
         if (clickedAddress == "") do return false
         local resolvedAddress = clickedAddress
-        for promotionIndex = 1 to 4 while (resolvedAddress == clickedAddress) do (
+        for promotionIndex in 1 to 8 while (resolvedAddress == clickedAddress) do (
             local promotionData = case promotionIndex of (
                 1: #("Donate", "https://store.payproglobal.com/checkout?products[1][id]=137852")
                 2: #("Visit maxpkg.dev", "https://maxpkg.dev")
                 3: #("Visit 3dground.net", "https://3dground.net")
                 4: #("More scripts on maxpkg.dev", "https://maxpkg.dev")
+                5: #("Support 3DGROUND on Patreon", "https://www.patreon.com/3dground")
+                6: #("Try Prune Scene", "https://3dground.net/en/prod/prune-scene-2180817")
+                7: #("Try Model Packer", "https://3dground.net/en/prod/model-packer-3091668")
+                8: #("Try CopyTo Pro", "https://3dground.net/en/prod/copyto-pro-3201577")
             )
             if (clickedAddress == promotionData[1]) do resolvedAddress = promotionData[2]
         )
@@ -2381,7 +2389,7 @@ struct DropperAppManager (
         dotNet.addEventHandler updateCheckTimer "Tick" onAutomaticUpdateTimerTick
         updateCheckTimer.Start()
         idlePromotionTimer = dotNetObject "System.Windows.Forms.Timer"
-        idlePromotionTimer.Interval = 20000
+        idlePromotionTimer.Interval = 10000
         dotNet.addEventHandler idlePromotionTimer "Tick" onIdlePromotionTimerTick
         idlePromotionTimer.Start()
         logPromotionTimer = dotNetObject "System.Windows.Forms.Timer"
