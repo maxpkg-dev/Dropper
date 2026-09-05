@@ -87,6 +87,7 @@ struct DropperAppManager (
     deferredDropTimer = undefined,
     deferredDropFilePaths = #(),
     updateCheckTimer = undefined,
+    updateWorker = undefined,
     updateRestartTimer = undefined,
     pendingRestartEntryPath = "",
     updateRestartAttempts = 0,
@@ -519,6 +520,9 @@ struct DropperAppManager (
             try (updateCheckTimer.Dispose()) catch()
             updateCheckTimer = undefined
         )
+        if (updateWorker != undefined) do (
+            try (if (updateWorker.IsBusy) do updateWorker.CancelAsync()) catch()
+        )
         if (idlePromotionTimer != undefined) do (
             try (idlePromotionTimer.Stop()) catch()
             try (idlePromotionTimer.Dispose()) catch()
@@ -800,25 +804,34 @@ struct DropperAppManager (
     ),
 
     fn getFinalUrlWithCurl sourceUrl = (
+        local curlProcess = undefined
         try (
             local processInfo = dotNetObject "System.Diagnostics.ProcessStartInfo"
             processInfo.FileName = "curl.exe"
-            processInfo.Arguments = "--location --fail --silent --show-error --output NUL --write-out \"%{url_effective}\" \"" + sourceUrl + "\""
+            processInfo.Arguments = "--location --fail --silent --show-error --proto =https --proto-redir =https --tlsv1.2 --connect-timeout 10 --max-time 60 --output NUL --write-out \"%{url_effective}\" \"" + sourceUrl + "\""
             processInfo.UseShellExecute = false
             processInfo.CreateNoWindow = true
+            processInfo.WindowStyle = (dotNetClass "System.Diagnostics.ProcessWindowStyle").Hidden
             processInfo.RedirectStandardOutput = true
             processInfo.RedirectStandardError = true
-            local curlProcess = dotNetObject "System.Diagnostics.Process"
+            curlProcess = dotNetObject "System.Diagnostics.Process"
             curlProcess.StartInfo = processInfo
             if (not curlProcess.Start()) do return ""
+            local didCurlExit = curlProcess.WaitForExit 65000
+            if (not didCurlExit) do (
+                try (curlProcess.Kill()) catch()
+                try (curlProcess.Dispose()) catch()
+                return ""
+            )
             local finalUrl = curlProcess.StandardOutput.ReadToEnd() as string
             curlProcess.StandardError.ReadToEnd()
-            curlProcess.WaitForExit()
             local curlSucceeded = curlProcess.ExitCode == 0 and finalUrl != ""
             curlProcess.Dispose()
+            curlProcess = undefined
             if (curlSucceeded) do return finalUrl
             return ""
         ) catch (
+            try (if (curlProcess != undefined) do curlProcess.Dispose()) catch()
             return ""
         )
     ),
@@ -843,20 +856,31 @@ struct DropperAppManager (
     ),
 
     fn downloadUpdateWithCurl sourceUrl destinationPath = (
+        local curlProcess = undefined
         try (
             local processInfo = dotNetObject "System.Diagnostics.ProcessStartInfo"
             processInfo.FileName = "curl.exe"
-            processInfo.Arguments = "--location --fail --silent --show-error --output \"" + destinationPath + "\" \"" + sourceUrl + "\""
+            processInfo.Arguments = "--location --fail --silent --show-error --proto =https --proto-redir =https --tlsv1.2 --connect-timeout 10 --max-time 60 --output \"" + destinationPath + "\" \"" + sourceUrl + "\""
             processInfo.UseShellExecute = false
             processInfo.CreateNoWindow = true
-            local curlProcess = dotNetObject "System.Diagnostics.Process"
+            processInfo.WindowStyle = (dotNetClass "System.Diagnostics.ProcessWindowStyle").Hidden
+            curlProcess = dotNetObject "System.Diagnostics.Process"
             curlProcess.StartInfo = processInfo
             if (not curlProcess.Start()) do return false
-            curlProcess.WaitForExit()
+            local didCurlExit = curlProcess.WaitForExit 65000
+            if (not didCurlExit) do (
+                try (curlProcess.Kill()) catch()
+                try (curlProcess.Dispose()) catch()
+                try ((dotNetClass "System.IO.File").Delete destinationPath) catch()
+                return false
+            )
             local curlSucceeded = curlProcess.ExitCode == 0 and fileIsNonEmpty destinationPath
             curlProcess.Dispose()
+            curlProcess = undefined
             return curlSucceeded
         ) catch (
+            try (if (curlProcess != undefined) do curlProcess.Dispose()) catch()
+            try (if ((dotNetClass "System.IO.File").Exists destinationPath) do (dotNetClass "System.IO.File").Delete destinationPath) catch()
             return false
         )
     ),
@@ -967,8 +991,8 @@ struct DropperAppManager (
         return true
     ),
 
-    fn checkForGithubUpdate = (
-        if (not isInstalledPackageRuntime()) do return true
+    fn performGithubUpdateCore updateWorkerSender = (
+        if (not isInstalledPackageRuntime()) do return ""
         local updateFilePath = ""
         local stagingFolderPath = ""
         try (
@@ -978,29 +1002,108 @@ struct DropperAppManager (
 
             local releaseData = getLatestReleaseData()
             if (releaseData == undefined or releaseData.count < 2) do throw "The latest release could not be resolved."
+            if (updateWorkerSender.CancellationPending) do return ""
             local latestVersion = releaseData[1]
             local packageUrl = releaseData[2]
-            if (not isNewerVersion latestVersion versionContent) do return true
+            if (not isNewerVersion latestVersion versionContent) do return ""
 
             local tempFolderPath = (dotNetClass "System.IO.Path").GetTempPath()
             local updateId = createGuidString()
             updateFilePath = (dotNetClass "System.IO.Path").Combine tempFolderPath ("Dropper-" + updateId + ".mzp")
             stagingFolderPath = (dotNetClass "System.IO.Path").Combine tempFolderPath ("DropperUpdate-" + updateId)
             if (not downloadUpdatePackage packageUrl updateFilePath) do throw "The update package could not be downloaded."
+            if (updateWorkerSender.CancellationPending) do (
+                try ((dotNetClass "System.IO.File").Delete updateFilePath) catch()
+                return ""
+            )
 
             (dotNetClass "System.IO.Directory").CreateDirectory stagingFolderPath
             dotNet.loadAssembly "System.IO.Compression.FileSystem"
             (dotNetClass "System.IO.Compression.ZipFile").ExtractToDirectory updateFilePath stagingFolderPath
+            if (updateWorkerSender.CancellationPending) do (
+                try ((dotNetClass "System.IO.Directory").Delete stagingFolderPath true) catch()
+                try ((dotNetClass "System.IO.File").Delete updateFilePath) catch()
+                return ""
+            )
             local restartEntryPath = copyExtractedUpdate stagingFolderPath
             if (restartEntryPath == "") do throw "The update package did not pass validation."
 
             try ((dotNetClass "System.IO.Directory").Delete stagingFolderPath true) catch()
             try ((dotNetClass "System.IO.File").Delete updateFilePath) catch()
-            if (not (scheduleUpdatedEntryRestart restartEntryPath)) do throw "The updated entry file could not be scheduled for restart."
-            return true
+            return restartEntryPath
         ) catch (
             try (if (stagingFolderPath != "" and (dotNetClass "System.IO.Directory").Exists stagingFolderPath) do (dotNetClass "System.IO.Directory").Delete stagingFolderPath true) catch()
             try (if (updateFilePath != "" and (dotNetClass "System.IO.File").Exists updateFilePath) do (dotNetClass "System.IO.File").Delete updateFilePath) catch()
+            return ""
+        )
+    ),
+
+    fn performGithubUpdate updateWorkerSender = (
+        local updateMutex = undefined
+        local ownsUpdateMutex = false
+        local updatedEntryPath = ""
+        try (
+            updateMutex = dotNetObject "System.Threading.Mutex" false "Local\\DropperUpdate-647fbcec-f70e-4305-92df-4f545e13354b"
+            ownsUpdateMutex = updateMutex.WaitOne 70000
+            if (ownsUpdateMutex and not updateWorkerSender.CancellationPending) do (
+                updatedEntryPath = performGithubUpdateCore updateWorkerSender
+            )
+        ) catch (
+            updatedEntryPath = ""
+        )
+        if (ownsUpdateMutex) do try (updateMutex.ReleaseMutex()) catch()
+        try (if (updateMutex != undefined) do updateMutex.Dispose()) catch()
+        return updatedEntryPath
+    ),
+
+    fn onUpdateWorkerDoWork senderObject eventArgs = (
+        if (senderObject.CancellationPending) do (
+            eventArgs.Cancel = true
+            return false
+        )
+        local updatedEntryPath = performGithubUpdate senderObject
+        if (senderObject.CancellationPending and updatedEntryPath == "") do (
+            eventArgs.Cancel = true
+            return false
+        )
+        eventArgs.Result = updatedEntryPath
+        return true
+    ),
+
+    fn onUpdateWorkerCompleted senderObject eventArgs = (
+        local updatedEntryPath = ""
+        try (
+            if (not eventArgs.Cancelled and eventArgs.Error == undefined and eventArgs.Result != undefined) do (
+                updatedEntryPath = eventArgs.Result as string
+            )
+        ) catch (
+            updatedEntryPath = ""
+        )
+        try (dotNet.removeEventHandler senderObject "DoWork" onUpdateWorkerDoWork) catch()
+        try (dotNet.removeEventHandler senderObject "RunWorkerCompleted" onUpdateWorkerCompleted) catch()
+        try (senderObject.Dispose()) catch()
+        updateWorker = undefined
+        if (not isCancelRequested and updatedEntryPath != "") do scheduleUpdatedEntryRestart updatedEntryPath
+        return true
+    ),
+
+    fn startAutomaticUpdateWorker = (
+        if (not isInstalledPackageRuntime()) do return true
+        if (updateWorker != undefined) do (
+            try (if (updateWorker.IsBusy) do return true) catch()
+            try (updateWorker.Dispose()) catch()
+            updateWorker = undefined
+        )
+        try (
+            updateWorker = dotNetObject "CSharpUtilities.SynchronizingBackgroundWorker"
+            updateWorker.WorkerSupportsCancellation = true
+            dotNet.addEventHandler updateWorker "DoWork" onUpdateWorkerDoWork
+            dotNet.addEventHandler updateWorker "RunWorkerCompleted" onUpdateWorkerCompleted
+            updateWorker.RunWorkerAsync()
+            return true
+        ) catch (
+            try (if (updateWorker != undefined) do updateWorker.Dispose()) catch()
+            updateWorker = undefined
             return false
         )
     ),
@@ -1009,7 +1112,7 @@ struct DropperAppManager (
         senderObject.Stop()
         senderObject.Dispose()
         updateCheckTimer = undefined
-        checkForGithubUpdate()
+        startAutomaticUpdateWorker()
         return true
     ),
 
