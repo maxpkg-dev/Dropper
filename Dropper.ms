@@ -73,6 +73,7 @@ struct DropperAppManager (
     settingsUniqueLayerCheck = undefined,
     deferredDropTimer = undefined,
     deferredDropFilePaths = #(),
+    statusLinkUrl = "",
     isLogVisible = false,
     highestSeverity = 0,
     warningCount = 0,
@@ -293,7 +294,51 @@ struct DropperAppManager (
     ),
 
     fn setStatus messageContent = (
-        if (statusLabel != undefined) do statusLabel.Text = messageContent
+        statusLinkUrl = ""
+        if (statusLabel != undefined) do (
+            statusLabel.Text = messageContent
+            statusLabel.SelectAll()
+            statusLabel.SelectionColor = themeTextColor()
+            statusLabel.SelectionFont = statusLabel.Font
+            statusLabel.Select 0 0
+            statusLabel.Cursor = (dotNetClass "System.Windows.Forms.Cursors").Default
+        )
+        return true
+    ),
+
+    fn getRandomPromotionData = (
+        local promotionIndex = random 1 4
+        case promotionIndex of (
+            1: return #("Donate to support Dropper", "https://store.payproglobal.com/checkout?products[1][id]=137852")
+            2: return #("Visit maxpkg.dev", "https://maxpkg.dev")
+            3: return #("Visit 3dground.net", "https://3dground.net")
+            4: return #("More scripts on maxpkg.dev", "https://maxpkg.dev")
+        )
+    ),
+
+    fn showRandomStatusPromotion prefixContent:"" = (
+        if (statusLabel == undefined) do return false
+        local promotionData = getRandomPromotionData()
+        statusLinkUrl = promotionData[2]
+        statusLabel.Text = prefixContent + promotionData[1]
+        statusLabel.SelectAll()
+        statusLabel.SelectionColor = themeAccentColor()
+        statusLabel.SelectionFont = dotNetObject "System.Drawing.Font" statusLabel.Font (dotNetClass "System.Drawing.FontStyle").Underline
+        statusLabel.Select 0 0
+        statusLabel.Cursor = (dotNetClass "System.Windows.Forms.Cursors").Hand
+        return true
+    ),
+
+    fn onStatusLinkClick senderObject eventArgs = (
+        if (statusLinkUrl == "") do return false
+        ShellLaunch statusLinkUrl ""
+        return true
+    ),
+
+    fn onLogLinkClicked senderObject linkClickedArgs = (
+        local clickedAddress = linkClickedArgs.LinkText as string
+        if (clickedAddress == "") do return false
+        ShellLaunch clickedAddress ""
         return true
     ),
 
@@ -1614,9 +1659,11 @@ struct DropperAppManager (
             addLog "Processing was cancelled." severityLevel:2
             setStatus "Cancelled"
         ) else if (failedCount > 0) then (
-            setStatus ("Completed: " + (successfulCount as string) + " successful, " + (failedCount as string) + " failed")
+            addLog ("Completed: " + (successfulCount as string) + " successful, " + (failedCount as string) + " failed") severityLevel:2
+            showRandomStatusPromotion prefixContent:"Done! "
         ) else (
-            setStatus ("Completed: " + (successfulCount as string) + " successful")
+            addLog ("Completed: " + (successfulCount as string) + " successful") severityLevel:1
+            showRandomStatusPromotion prefixContent:"Done! "
         )
         isBusy = false
         return (failedCount == 0 and not isCancelRequested)
@@ -1645,6 +1692,8 @@ struct DropperAppManager (
         dotNet.addEventHandler deferredDropTimer "Tick" onDeferredDropTimerTick
         deferredDropTimer.Start()
         setStatus ("Queued " + (sourceFilePaths.count as string) + " file(s)")
+        local logPromotionData = getRandomPromotionData()
+        addLog (logPromotionData[1] + ": " + logPromotionData[2])
         return true
     ),
 
@@ -1705,11 +1754,18 @@ struct DropperAppManager (
         )
         mainForm.Controls.Add dropPanel
 
-        statusLabel = dotNetObject "System.Windows.Forms.Label"
+        statusLabel = dotNetObject "System.Windows.Forms.RichTextBox"
         statusLabel.Text = "Ready"
         statusLabel.Location = dotNetObject "System.Drawing.Point" 10 106
         statusLabel.Size = dotNetObject "System.Drawing.Size" 276 20
+        statusLabel.ReadOnly = true
+        statusLabel.Multiline = false
+        statusLabel.BorderStyle = (dotNetClass "System.Windows.Forms.BorderStyle").None
+        statusLabel.ScrollBars = (dotNetClass "System.Windows.Forms.RichTextBoxScrollBars").None
+        statusLabel.BackColor = themeBackgroundColor()
         statusLabel.ForeColor = themeTextColor()
+        statusLabel.DetectUrls = false
+        statusLabel.TabStop = false
         mainForm.Controls.Add statusLabel
 
         local helpButton = dotNetObject "System.Windows.Forms.Button"
@@ -1740,6 +1796,7 @@ struct DropperAppManager (
         logBox.ReadOnly = true
         logBox.Multiline = true
         logBox.WordWrap = false
+        logBox.DetectUrls = true
         logBox.ScrollBars = (dotNetClass "System.Windows.Forms.RichTextBoxScrollBars").Both
         logBox.BackColor = themeInputColor()
         logBox.ForeColor = themeTextColor()
@@ -1753,6 +1810,8 @@ struct DropperAppManager (
         dotNet.addEventHandler settingsButton "Click" onSettingsButtonClick
         dotNet.addEventHandler helpButton "Click" onHelpButtonClick
         dotNet.addEventHandler logButton "Click" onToggleLog
+        dotNet.addEventHandler statusLabel "Click" onStatusLinkClick
+        dotNet.addEventHandler logBox "LinkClicked" onLogLinkClicked
         dotNet.addEventHandler mainForm "FormClosing" onMainFormClosing
 
         restoreWindowPosition()
