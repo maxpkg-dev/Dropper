@@ -1,5 +1,5 @@
 /*
-    Dropper 1.0.0
+    Dropper
     Drag archives, 3D files, and bitmap images into a compact 3ds Max toolbox.
 */
 
@@ -56,7 +56,7 @@ struct DropperPlacementData (
 )
 
 struct DropperAppManager (
-    versionContent = "1.0.0",
+    versionContent = "Unknown",
     entryFilePath = "",
     scriptFolderPath = "",
     iniFilePath = "",
@@ -86,6 +86,9 @@ struct DropperAppManager (
     deferredDropTimer = undefined,
     deferredDropFilePaths = #(),
     updateCheckTimer = undefined,
+    updateRestartTimer = undefined,
+    pendingRestartEntryPath = "",
+    updateRestartAttempts = 0,
     idlePromotionTimer = undefined,
     logPromotionTimer = undefined,
     logPromotionLinks = #(),
@@ -183,7 +186,8 @@ struct DropperAppManager (
     fn readPackageVersionFromIni sourceIniFile sectionName settingKey = (
         if (not (dotNetClass "System.IO.File").Exists sourceIniFile) do return ""
         local resolvedVersion = ""
-        try (resolvedVersion = trimString (getINISetting sourceIniFile sectionName settingKey)) catch (resolvedVersion = "")
+        try (resolvedVersion = getINISetting sourceIniFile sectionName settingKey) catch (resolvedVersion = "")
+        if (resolvedVersion == undefined) do resolvedVersion = ""
         return resolvedVersion
     ),
 
@@ -192,7 +196,7 @@ struct DropperAppManager (
         if (resolvedVersion == "") do (
             resolvedVersion = readPackageVersionFromIni (scriptFolderPath + "maxpkg-packager.ini") "settings" "version"
         )
-        if (resolvedVersion == "") do resolvedVersion = "1.0.0"
+        if (resolvedVersion == "") do resolvedVersion = "Unknown"
         return resolvedVersion
     ),
 
@@ -744,18 +748,97 @@ struct DropperAppManager (
         return false
     ),
 
-    fn getGithubReleaseValue responseText propertyName valuePattern = (
-        local regexClass = dotNetClass "System.Text.RegularExpressions.Regex"
-        local regexOptions = dotNetClass "System.Text.RegularExpressions.RegexOptions"
-        local propertyPattern = "\"" + propertyName + "\"\\s*:\\s*\"(" + valuePattern + ")\""
-        local matchData = regexClass.Match responseText propertyPattern regexOptions.IgnoreCase
-        if (not matchData.Success) do return ""
-        return matchData.Groups.Item[1].Value
-    ),
-
     fn fileIsNonEmpty filePath = (
         if (not (dotNetClass "System.IO.File").Exists filePath) do return false
         try (return ((dotNetObject "System.IO.FileInfo" filePath).Length > 0)) catch (return false)
+    ),
+
+    fn filePathIsInsideFolder sourceFilePath rootFolderPath = (
+        local normalizedFilePath = toLower ((dotNetClass "System.IO.Path").GetFullPath sourceFilePath)
+        local normalizedRootPath = toLower (normalizeFolderPath ((dotNetClass "System.IO.Path").GetFullPath rootFolderPath))
+        if (normalizedFilePath.count < normalizedRootPath.count) do return false
+        return (substring normalizedFilePath 1 normalizedRootPath.count) == normalizedRootPath
+    ),
+
+    fn isInstalledPackageRuntime = (
+        if (entryFilePath == undefined or entryFilePath == "") do return false
+        local normalizedEntryPath = toLower ((dotNetClass "System.IO.Path").GetFullPath entryFilePath)
+        if ((toLower ((dotNetClass "System.IO.Path").GetExtension normalizedEntryPath)) != ".mse") do return false
+        local runtimeFolderPath = normalizeFolderPath ((dotNetClass "System.IO.Path").GetDirectoryName normalizedEntryPath)
+        local packageGuid = "647fbcec-f70e-4305-92df-4f545e13354b"
+        local expectedRuntimeFolder = normalizeFolderPath ((dotNetClass "System.IO.Path").Combine (getDir #temp) packageGuid)
+        if ((toLower runtimeFolderPath) != (toLower expectedRuntimeFolder)) do return false
+        local manifestPath = runtimeFolderPath + "manifest.ini"
+        if (not (dotNetClass "System.IO.File").Exists manifestPath) do return false
+        if ((toLower (getINISetting manifestPath "package" "packageGuid")) != packageGuid) do return false
+        local packageVersion = getINISetting manifestPath "package" "version"
+        if (packageVersion == undefined or not (dotNetClass "System.Text.RegularExpressions.Regex").IsMatch packageVersion "^\\d+\\.\\d+\\.\\d+$") do return false
+        local packageEntry = getINISetting manifestPath "package" "entry"
+        if (packageEntry == undefined or packageEntry == "") do return false
+        local manifestEntryPath = toLower ((dotNetClass "System.IO.Path").GetFullPath ((dotNetClass "System.IO.Path").Combine runtimeFolderPath packageEntry))
+        return normalizedEntryPath == manifestEntryPath
+    ),
+
+    fn getFinalUrlWithDotNet sourceUrl = (
+        local responseObject = undefined
+        try (
+            local requestObject = (dotNetClass "System.Net.WebRequest").Create sourceUrl
+            requestObject.Method = "HEAD"
+            requestObject.AllowAutoRedirect = true
+            requestObject.UserAgent = "Dropper-3dsMax"
+            requestObject.Timeout = 5000
+            requestObject.ReadWriteTimeout = 5000
+            responseObject = requestObject.GetResponse()
+            local finalUrl = responseObject.ResponseUri.AbsoluteUri as string
+            responseObject.Close()
+            return finalUrl
+        ) catch (
+            try (if (responseObject != undefined) do responseObject.Close()) catch()
+            return ""
+        )
+    ),
+
+    fn getFinalUrlWithCurl sourceUrl = (
+        try (
+            local processInfo = dotNetObject "System.Diagnostics.ProcessStartInfo"
+            processInfo.FileName = "curl.exe"
+            processInfo.Arguments = "--location --fail --silent --show-error --output NUL --write-out \"%{url_effective}\" \"" + sourceUrl + "\""
+            processInfo.UseShellExecute = false
+            processInfo.CreateNoWindow = true
+            processInfo.RedirectStandardOutput = true
+            processInfo.RedirectStandardError = true
+            local curlProcess = dotNetObject "System.Diagnostics.Process"
+            curlProcess.StartInfo = processInfo
+            if (not curlProcess.Start()) do return ""
+            local finalUrl = curlProcess.StandardOutput.ReadToEnd() as string
+            curlProcess.StandardError.ReadToEnd()
+            curlProcess.WaitForExit()
+            local curlSucceeded = curlProcess.ExitCode == 0 and finalUrl != ""
+            curlProcess.Dispose()
+            if (curlSucceeded) do return finalUrl
+            return ""
+        ) catch (
+            return ""
+        )
+    ),
+
+    fn getLatestReleaseData = (
+        local latestReleaseUrl = "https://github.com/maxpkg-dev/Dropper/releases/latest"
+        local finalUrl = getFinalUrlWithDotNet latestReleaseUrl
+        if (finalUrl == "") do finalUrl = getFinalUrlWithCurl latestReleaseUrl
+        if (finalUrl == "") do return undefined
+        local releaseMarker = "/releases/tag/"
+        local markerIndex = findString (toLower finalUrl) releaseMarker
+        if (markerIndex == undefined) do return undefined
+        local releaseTag = substring finalUrl (markerIndex + releaseMarker.count) -1
+        releaseTag = (dotNetClass "System.Uri").UnescapeDataString releaseTag
+        if (releaseTag == "") do return undefined
+        local latestVersion = releaseTag
+        if (latestVersion.count > 0 and (toLower (substring latestVersion 1 1)) == "v") do latestVersion = substring latestVersion 2 (latestVersion.count - 1)
+        if (not (dotNetClass "System.Text.RegularExpressions.Regex").IsMatch latestVersion "^\\d+\\.\\d+\\.\\d+$") do return undefined
+        local packageFileName = "dropper@" + latestVersion + "@647fbcec-f70e-4305-92df-4f545e13354b.mzp"
+        local packageUrl = "https://github.com/maxpkg-dev/Dropper/releases/download/" + releaseTag + "/" + packageFileName
+        return #(latestVersion, packageUrl)
     ),
 
     fn downloadUpdateWithCurl sourceUrl destinationPath = (
@@ -778,23 +861,48 @@ struct DropperAppManager (
     ),
 
     fn downloadUpdatePackage sourceUrl destinationPath = (
+        local responseObject = undefined
+        local inputStream = undefined
+        local outputStream = undefined
         try (
             if ((dotNetClass "System.IO.File").Exists destinationPath) do (dotNetClass "System.IO.File").Delete destinationPath
-            local webClient = dotNetObject "System.Net.WebClient"
-            webClient.Headers.Add "User-Agent" "Dropper-3dsMax"
-            webClient.DownloadFile sourceUrl destinationPath
+            local requestObject = (dotNetClass "System.Net.WebRequest").Create sourceUrl
+            requestObject.Method = "GET"
+            requestObject.AllowAutoRedirect = true
+            requestObject.UserAgent = "Dropper-3dsMax"
+            requestObject.Timeout = 10000
+            requestObject.ReadWriteTimeout = 10000
+            responseObject = requestObject.GetResponse()
+            inputStream = responseObject.GetResponseStream()
+            outputStream = (dotNetClass "System.IO.File").Create destinationPath
+            inputStream.CopyTo outputStream
+            outputStream.Dispose()
+            outputStream = undefined
+            inputStream.Dispose()
+            inputStream = undefined
+            responseObject.Close()
+            responseObject = undefined
             if (fileIsNonEmpty destinationPath) do return true
-        ) catch()
+        ) catch (
+            try (if (outputStream != undefined) do outputStream.Dispose()) catch()
+            try (if (inputStream != undefined) do inputStream.Dispose()) catch()
+            try (if (responseObject != undefined) do responseObject.Close()) catch()
+        )
         try (if ((dotNetClass "System.IO.File").Exists destinationPath) do (dotNetClass "System.IO.File").Delete destinationPath) catch()
         return downloadUpdateWithCurl sourceUrl destinationPath
     ),
 
     fn copyExtractedUpdate stagingFolderPath = (
         local manifestPath = (dotNetClass "System.IO.Path").Combine stagingFolderPath "manifest.ini"
-        if (not (dotNetClass "System.IO.File").Exists manifestPath) do return false
-        if ((toLower (getINISetting manifestPath "package" "packageGuid")) != "647fbcec-f70e-4305-92df-4f545e13354b") do return false
+        if (not (dotNetClass "System.IO.File").Exists manifestPath) do return ""
+        if ((toLower (getINISetting manifestPath "package" "packageGuid")) != "647fbcec-f70e-4305-92df-4f545e13354b") do return ""
         local packageVersion = getINISetting manifestPath "package" "version"
-        if (not isNewerVersion packageVersion versionContent) do return false
+        if (not isNewerVersion packageVersion versionContent) do return ""
+        local packageEntry = getINISetting manifestPath "package" "entry"
+        if (packageEntry == undefined or packageEntry == "") do return ""
+        local sourceEntryPath = (dotNetClass "System.IO.Path").GetFullPath ((dotNetClass "System.IO.Path").Combine stagingFolderPath packageEntry)
+        if (not (filePathIsInsideFolder sourceEntryPath stagingFolderPath)) do return ""
+        if (not fileIsNonEmpty sourceEntryPath) do return ""
 
         local searchOption = (dotNetClass "System.IO.SearchOption").AllDirectories
         local extractedFiles = (dotNetClass "System.IO.Directory").GetFiles stagingFolderPath "*" searchOption
@@ -811,11 +919,55 @@ struct DropperAppManager (
                 (dotNetClass "System.IO.File").Copy sourceFilePath destinationPath true
             )
         )
+        local destinationEntryPath = (dotNetClass "System.IO.Path").GetFullPath ((dotNetClass "System.IO.Path").Combine scriptFolderPath packageEntry)
+        if (not (filePathIsInsideFolder destinationEntryPath scriptFolderPath)) do return ""
+        if (not fileIsNonEmpty destinationEntryPath) do return ""
+        return destinationEntryPath
+    ),
+
+    fn onUpdateRestartTimerTick senderObject eventArgs = (
+        senderObject.Stop()
+        updateRestartAttempts += 1
+        try (
+            if (pendingRestartEntryPath == "" or not (fileIsNonEmpty pendingRestartEntryPath)) do throw "The updated entry file is missing."
+            local restartFilePath = pendingRestartEntryPath
+            fileIn restartFilePath
+            senderObject.Dispose()
+            updateRestartTimer = undefined
+            pendingRestartEntryPath = ""
+            return true
+        ) catch (
+            local restartErrorMessage = getCurrentException() as string
+            if (updateRestartAttempts < 3) then (
+                senderObject.Start()
+            ) else (
+                senderObject.Dispose()
+                updateRestartTimer = undefined
+                pendingRestartEntryPath = ""
+                format "Dropper automatic restart failed: %\n" restartErrorMessage
+            )
+            return false
+        )
+    ),
+
+    fn scheduleUpdatedEntryRestart updatedEntryPath = (
+        if (updatedEntryPath == undefined or updatedEntryPath == "" or not (fileIsNonEmpty updatedEntryPath)) do return false
+        local activeEntryPath = entryFilePath
+        if (activeEntryPath != undefined and activeEntryPath != "" and (toLower ((dotNetClass "System.IO.Path").GetExtension activeEntryPath)) == ".mse" and fileIsNonEmpty activeEntryPath) then (
+            pendingRestartEntryPath = activeEntryPath
+        ) else (
+            pendingRestartEntryPath = updatedEntryPath
+        )
+        updateRestartAttempts = 0
+        updateRestartTimer = dotNetObject "System.Windows.Forms.Timer"
+        updateRestartTimer.Interval = 350
+        dotNet.addEventHandler updateRestartTimer "Tick" onUpdateRestartTimerTick
+        updateRestartTimer.Start()
         return true
     ),
 
     fn checkForGithubUpdate = (
-        local latestReleaseApiUrl = "https://api.github.com/repos/maxpkg-dev/Dropper/releases/latest"
+        if (not isInstalledPackageRuntime()) do return true
         local updateFilePath = ""
         local stagingFolderPath = ""
         try (
@@ -823,17 +975,12 @@ struct DropperAppManager (
             local securityProtocolClass = dotNetClass "System.Net.SecurityProtocolType"
             servicePointManagerClass.SecurityProtocol = securityProtocolClass.Tls12
 
-            local webClient = dotNetObject "System.Net.WebClient"
-            webClient.Headers.Add "User-Agent" "Dropper-3dsMax"
-            webClient.Headers.Add "Accept" "application/vnd.github+json"
-            local responseText = webClient.DownloadString latestReleaseApiUrl
-            local latestVersion = getGithubReleaseValue responseText "tag_name" "[^\"]+"
-            local packageUrl = getGithubReleaseValue responseText "browser_download_url" "[^\"]+\\.mzp"
-
-            if (latestVersion == "") do throw "The latest release does not contain a version tag."
+            local releaseData = getLatestReleaseData()
+            if (releaseData == undefined or releaseData.count < 2) do throw "The latest release could not be resolved."
+            local latestVersion = releaseData[1]
+            local packageUrl = releaseData[2]
             if (not isNewerVersion latestVersion versionContent) do return true
 
-            if (packageUrl == "") do throw "The latest release does not contain an MZP package."
             local tempFolderPath = (dotNetClass "System.IO.Path").GetTempPath()
             local updateId = createGuidString()
             updateFilePath = (dotNetClass "System.IO.Path").Combine tempFolderPath ("Dropper-" + updateId + ".mzp")
@@ -843,13 +990,12 @@ struct DropperAppManager (
             (dotNetClass "System.IO.Directory").CreateDirectory stagingFolderPath
             dotNet.loadAssembly "System.IO.Compression.FileSystem"
             (dotNetClass "System.IO.Compression.ZipFile").ExtractToDirectory updateFilePath stagingFolderPath
-            if (not copyExtractedUpdate stagingFolderPath) do throw "The update package did not pass validation."
+            local restartEntryPath = copyExtractedUpdate stagingFolderPath
+            if (restartEntryPath == "") do throw "The update package did not pass validation."
 
-            local restartEntryPath = scriptFolderPath + "Dropper.ms"
-            if (mainForm != undefined) do mainForm.Close()
-            fileIn restartEntryPath
             try ((dotNetClass "System.IO.Directory").Delete stagingFolderPath true) catch()
             try ((dotNetClass "System.IO.File").Delete updateFilePath) catch()
+            if (not (scheduleUpdatedEntryRestart restartEntryPath)) do throw "The updated entry file could not be scheduled for restart."
             return true
         ) catch (
             try (if (stagingFolderPath != "" and (dotNetClass "System.IO.Directory").Exists stagingFolderPath) do (dotNetClass "System.IO.Directory").Delete stagingFolderPath true) catch()
@@ -2384,10 +2530,12 @@ struct DropperAppManager (
         if (not canWriteSettingsFolder()) do (
             addLog ("Settings folder is not writable: " + scriptFolderPath) severityLevel:3
         )
-        updateCheckTimer = dotNetObject "System.Windows.Forms.Timer"
-        updateCheckTimer.Interval = 1200
-        dotNet.addEventHandler updateCheckTimer "Tick" onAutomaticUpdateTimerTick
-        updateCheckTimer.Start()
+        if (isInstalledPackageRuntime()) do (
+            updateCheckTimer = dotNetObject "System.Windows.Forms.Timer"
+            updateCheckTimer.Interval = 1200
+            dotNet.addEventHandler updateCheckTimer "Tick" onAutomaticUpdateTimerTick
+            updateCheckTimer.Start()
+        )
         idlePromotionTimer = dotNetObject "System.Windows.Forms.Timer"
         idlePromotionTimer.Interval = 10000
         dotNet.addEventHandler idlePromotionTimer "Tick" onIdlePromotionTimerTick
