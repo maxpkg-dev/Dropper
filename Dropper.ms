@@ -71,6 +71,8 @@ struct DropperAppManager (
     settingsRenameNodesCheck = undefined,
     settingsRenameMaterialsCheck = undefined,
     settingsUniqueLayerCheck = undefined,
+    deferredDropTimer = undefined,
+    deferredDropFilePaths = #(),
     isLogVisible = false,
     highestSeverity = 0,
     warningCount = 0,
@@ -355,6 +357,12 @@ struct DropperAppManager (
     fn onMainFormClosing senderObject formClosingArgs = (
         rememberWindowPosition()
         isCancelRequested = true
+        if (deferredDropTimer != undefined) do (
+            try (deferredDropTimer.Stop()) catch()
+            try (deferredDropTimer.Dispose()) catch()
+            deferredDropTimer = undefined
+            deferredDropFilePaths = #()
+        )
         if (helpForm != undefined) do try (helpForm.Close()) catch()
         if (settingsForm != undefined) do try (settingsForm.Close()) catch()
         if (dropPanelImage != undefined) do (
@@ -1614,10 +1622,36 @@ struct DropperAppManager (
         return (failedCount == 0 and not isCancelRequested)
     ),
 
+    fn onDeferredDropTimerTick senderObject eventArgs = (
+        local queuedFilePaths = deferredDropFilePaths
+        try (senderObject.Stop()) catch()
+        try (senderObject.Dispose()) catch()
+        deferredDropTimer = undefined
+        deferredDropFilePaths = #()
+        if (queuedFilePaths.count > 0) do processDroppedFiles queuedFilePaths
+        return true
+    ),
+
+    fn queueDroppedFiles fileCollection = (
+        if (isBusy or deferredDropTimer != undefined) do (
+            addLog "Dropper is already processing files." severityLevel:2
+            return false
+        )
+        local sourceFilePaths = convertFileCollection fileCollection
+        if (sourceFilePaths.count == 0) do return false
+        deferredDropFilePaths = sourceFilePaths
+        deferredDropTimer = dotNetObject "System.Windows.Forms.Timer"
+        deferredDropTimer.Interval = 20
+        dotNet.addEventHandler deferredDropTimer "Tick" onDeferredDropTimerTick
+        deferredDropTimer.Start()
+        setStatus ("Queued " + (sourceFilePaths.count as string) + " file(s)")
+        return true
+    ),
+
     fn onDropPanelDragDrop senderObject dragEventArgs = (
         local dataFormatsClass = dotNetClass "System.Windows.Forms.DataFormats"
         local droppedFiles = dragEventArgs.Data.GetData dataFormatsClass.FileDrop
-        return processDroppedFiles droppedFiles
+        return queueDroppedFiles droppedFiles
     ),
 
     fn onDropPanelClick senderObject eventArgs = (
