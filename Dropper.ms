@@ -60,6 +60,8 @@ struct DropperAppManager (
     dropPanel = undefined,
     dropPanelImage = undefined,
     statusLabel = undefined,
+    settingsButton = undefined,
+    helpButton = undefined,
     logButton = undefined,
     logBorderPanel = undefined,
     logBox = undefined,
@@ -315,6 +317,11 @@ struct DropperAppManager (
         return true
     ),
 
+    fn boost = (
+        if (((maxVersion())[1] / 1000) >= 13) do windows.processPostedMessages()
+        return true
+    ),
+
     fn setStatus messageContent = (
         restartIdlePromotionTimer()
         statusLinkUrl = ""
@@ -325,6 +332,7 @@ struct DropperAppManager (
             statusLabel.SelectionFont = statusLabel.Font
             statusLabel.Select 0 0
             statusLabel.Cursor = (dotNetClass "System.Windows.Forms.Cursors").Default
+            statusLabel.Refresh()
         )
         return true
     ),
@@ -459,7 +467,7 @@ struct DropperAppManager (
         if (mainForm == undefined or logBox == undefined or logBorderPanel == undefined) do return false
         isLogVisible = not isLogVisible
         logBorderPanel.Visible = isLogVisible
-        mainForm.ClientSize = dotNetObject "System.Drawing.Size" 330 (if isLogVisible then 440 else 160)
+        mainForm.ClientSize = dotNetObject "System.Drawing.Size" 360 (if isLogVisible then 555 else 275)
         updateLogButton()
         return true
     ),
@@ -681,6 +689,10 @@ struct DropperAppManager (
         dotNet.addEventHandler leftButton "Click" onOrientLeft
         dotNet.addEventHandler topButton "Click" onOrientTop
         dotNet.addEventHandler orientationForm "FormClosed" onOrientationFormClosed
+        dotNet.setLifetimeControl closeOrientationButton #dotnet
+        dotNet.setLifetimeControl frontButton #dotnet
+        dotNet.setLifetimeControl leftButton #dotnet
+        dotNet.setLifetimeControl topButton #dotnet
         orientationForm.Show mainForm
         orientationForm.ClientSize = dotNetObject "System.Drawing.Size" 74 132
         positionOrientationForm()
@@ -910,6 +922,9 @@ struct DropperAppManager (
         dotNet.addEventHandler helpMaxPkgLink "Click" onOpenMaxPkg
         dotNet.addEventHandler helpDonateButton "Click" onDonate
         dotNet.addEventHandler helpForm "FormClosed" onHelpFormClosed
+        dotNet.setLifetimeControl helpGroundLink #dotnet
+        dotNet.setLifetimeControl helpMaxPkgLink #dotnet
+        dotNet.setLifetimeControl helpDonateButton #dotnet
         helpForm.Show mainForm
         return true
     ),
@@ -1214,6 +1229,10 @@ struct DropperAppManager (
         dotNet.addEventHandler maxPkgLink "Click" onOpenMaxPkg
         dotNet.addEventHandler donateButton "Click" onDonate
         dotNet.addEventHandler settingsForm "FormClosed" onSettingsFormClosed
+        dotNet.setLifetimeControl browseRarButton #dotnet
+        dotNet.setLifetimeControl groundLink #dotnet
+        dotNet.setLifetimeControl maxPkgLink #dotnet
+        dotNet.setLifetimeControl donateButton #dotnet
 
         enableAccelerators = false
         settingsForm.Show mainForm
@@ -1312,41 +1331,70 @@ struct DropperAppManager (
         return candidateData
     ),
 
+    fn onCandidateListDrawItem senderObject eventArgs = (
+        if (eventArgs.Index < 0) do return false
+        local isSelected = senderObject.SelectedIndex == eventArgs.Index
+        local backgroundColor = if isSelected then themeAccentColor() else themeInputColor()
+        local foregroundColor = themeTextColor()
+        local itemContent = senderObject.Items.Item[eventArgs.Index] as string
+        local textFlags = (dotNetClass "System.Windows.Forms.TextFormatFlags").Left
+        (dotNetClass "System.Windows.Forms.TextRenderer").DrawText eventArgs.Graphics itemContent senderObject.Font eventArgs.Bounds foregroundColor backgroundColor textFlags
+        return true
+    ),
+
     fn chooseSceneCandidate candidateArray dialogTitle = (
         if (candidateArray.count == 0) do return undefined
         if (candidateArray.count == 1) do return candidateArray[1]
         local chooserForm = dotNetObject "System.Windows.Forms.Form"
         chooserForm.Text = dialogTitle
         chooserForm.FormBorderStyle = (dotNetClass "System.Windows.Forms.FormBorderStyle").FixedToolWindow
-        chooserForm.ClientSize = dotNetObject "System.Drawing.Size" 620 320
+        chooserForm.ClientSize = dotNetObject "System.Drawing.Size" 460 320
         chooserForm.StartPosition = (dotNetClass "System.Windows.Forms.FormStartPosition").CenterParent
         chooserForm.ShowInTaskbar = false
+        chooserForm.TopMost = true
+        applyFormTheme chooserForm
+        local candidateListBorderPanel = dotNetObject "System.Windows.Forms.Panel"
+        candidateListBorderPanel.Location = dotNetObject "System.Drawing.Point" 10 10
+        candidateListBorderPanel.Size = dotNetObject "System.Drawing.Size" 440 260
+        candidateListBorderPanel.BackColor = themeInputBorderColor()
+        chooserForm.Controls.Add candidateListBorderPanel
         local candidateListBox = dotNetObject "System.Windows.Forms.ListBox"
-        candidateListBox.Location = dotNetObject "System.Drawing.Point" 10 10
-        candidateListBox.Size = dotNetObject "System.Drawing.Size" 600 260
+        candidateListBox.Location = dotNetObject "System.Drawing.Point" 1 1
+        candidateListBox.Size = dotNetObject "System.Drawing.Size" 438 258
+        candidateListBox.BackColor = themeInputColor()
+        candidateListBox.ForeColor = themeTextColor()
+        candidateListBox.BorderStyle = (dotNetClass "System.Windows.Forms.BorderStyle").None
+        candidateListBox.DrawMode = (dotNetClass "System.Windows.Forms.DrawMode").OwnerDrawFixed
+        candidateListBox.IntegralHeight = false
+        candidateListBox.ItemHeight = 18
         candidateListBox.HorizontalScrollbar = true
         for candidateData in candidateArray do (
-            local displayContent = candidateData.relativeFilePath + " | " + candidateData.rendererTag
+            local displayContent = (dotNetClass "System.IO.Path").GetFileName candidateData.sourceFilePath
+            displayContent += " | " + candidateData.rendererTag
             if (candidateData.versionLabel != "") do displayContent += " | " + candidateData.versionLabel
             if (candidateData.warningMessage != "") do displayContent += " | WARNING: " + candidateData.warningMessage
             candidateListBox.Items.Add displayContent
         )
         candidateListBox.SelectedIndex = 0
-        chooserForm.Controls.Add candidateListBox
+        candidateListBorderPanel.Controls.Add candidateListBox
         local useButton = dotNetObject "System.Windows.Forms.Button"
         useButton.Text = "Use Selected"
-        useButton.Location = dotNetObject "System.Drawing.Point" 390 280
+        useButton.Location = dotNetObject "System.Drawing.Point" 230 280
         useButton.Size = dotNetObject "System.Drawing.Size" 130 28
         useButton.DialogResult = (dotNetClass "System.Windows.Forms.DialogResult").OK
+        applyButtonTheme useButton accentButton:true
         chooserForm.Controls.Add useButton
         local cancelButton = dotNetObject "System.Windows.Forms.Button"
         cancelButton.Text = "Cancel"
-        cancelButton.Location = dotNetObject "System.Drawing.Point" 530 280
+        cancelButton.Location = dotNetObject "System.Drawing.Point" 370 280
         cancelButton.Size = dotNetObject "System.Drawing.Size" 80 28
         cancelButton.DialogResult = (dotNetClass "System.Windows.Forms.DialogResult").Cancel
+        applyButtonTheme cancelButton
         chooserForm.Controls.Add cancelButton
         chooserForm.AcceptButton = useButton
         chooserForm.CancelButton = cancelButton
+        dotNet.addEventHandler candidateListBox "DrawItem" onCandidateListDrawItem
+        dotNet.setLifetimeControl candidateListBox #dotnet
         local dialogResult = chooserForm.ShowDialog mainForm
         local selectedIndex = candidateListBox.SelectedIndex
         chooserForm.Dispose()
@@ -1403,6 +1451,8 @@ struct DropperAppManager (
 
     fn performSafeMerge maxFilePath = (
         local isSuccessful = false
+        setStatus ("Merging " + (dotNetClass "System.IO.Path").GetFileName maxFilePath)
+        boost()
         try (
             if (settingsData.renameDuplicateNodes and settingsData.renameDuplicateMaterials) then (
                 isSuccessful = mergeMAXFile maxFilePath #select #noRedraw #autoRenameDups #renameMtlDups #neverReparent quiet:true
@@ -1422,6 +1472,8 @@ struct DropperAppManager (
 
     fn performModelImport modelFilePath = (
         local isSuccessful = false
+        setStatus ("Importing " + (dotNetClass "System.IO.Path").GetFileName modelFilePath)
+        boost()
         try (
             if (settingsData.showImporterDialogs) then (isSuccessful = importFile modelFilePath) else (isSuccessful = importFile modelFilePath #noPrompt)
         ) catch (
@@ -1613,7 +1665,7 @@ struct DropperAppManager (
         if (not groundNewNodes sceneNodeArray) do addLog "Could not calculate model bounds; Z position was preserved." severityLevel:2
         assignNodesToUniqueLayer sceneNodeArray sourceFilePath
         relinkTextures sceneNodeArray searchFolderPath
-        try (select sceneNodeArray; max tool zoomextents) catch (addLog "Viewport zoom could not be completed." severityLevel:2)
+        try (select sceneNodeArray; max tool zoomextents all) catch (addLog "Viewport zoom could not be completed." severityLevel:2)
         redrawViews()
         return true
     ),
@@ -2167,7 +2219,7 @@ struct DropperAppManager (
     ),
 
     fn loadDropPanelImage = (
-        local imageFilePath = scriptFolderPath + "assets\\drop-zone-banner-active.png"
+        local imageFilePath = scriptFolderPath + "assets\\drop-zone.png"
         local sourceImage = undefined
         local loadedImage = undefined
         if (not (dotNetClass "System.IO.File").Exists imageFilePath) do return undefined
@@ -2185,7 +2237,7 @@ struct DropperAppManager (
         mainForm = dotNetObject "System.Windows.Forms.Form"
         mainForm.Text = "Dropper " + versionContent
         mainForm.FormBorderStyle = (dotNetClass "System.Windows.Forms.FormBorderStyle").FixedToolWindow
-        mainForm.ClientSize = dotNetObject "System.Drawing.Size" 330 160
+        mainForm.ClientSize = dotNetObject "System.Drawing.Size" 360 275
         mainForm.MaximizeBox = false
         mainForm.MinimizeBox = false
         mainForm.ShowInTaskbar = false
@@ -2193,8 +2245,8 @@ struct DropperAppManager (
         applyFormTheme mainForm
 
         dropPanel = dotNetObject "System.Windows.Forms.Panel"
-        dropPanel.Location = dotNetObject "System.Drawing.Point" 10 10
-        dropPanel.Size = dotNetObject "System.Drawing.Size" 310 88
+        dropPanel.Location = dotNetObject "System.Drawing.Point" 0 0
+        dropPanel.Size = dotNetObject "System.Drawing.Size" 360 213
         dropPanel.AllowDrop = true
         dropPanel.BorderStyle = (dotNetClass "System.Windows.Forms.BorderStyle").None
         dropPanel.BackColor = themeBackgroundColor()
@@ -2208,8 +2260,8 @@ struct DropperAppManager (
 
         statusLabel = dotNetObject "System.Windows.Forms.RichTextBox"
         statusLabel.Text = "Ready"
-        statusLabel.Location = dotNetObject "System.Drawing.Point" 10 106
-        statusLabel.Size = dotNetObject "System.Drawing.Size" 276 20
+        statusLabel.Location = dotNetObject "System.Drawing.Point" 10 221
+        statusLabel.Size = dotNetObject "System.Drawing.Size" 306 20
         statusLabel.ReadOnly = true
         statusLabel.Multiline = false
         statusLabel.BorderStyle = (dotNetClass "System.Windows.Forms.BorderStyle").None
@@ -2220,38 +2272,38 @@ struct DropperAppManager (
         statusLabel.TabStop = false
         mainForm.Controls.Add statusLabel
 
-        local helpButton = dotNetObject "System.Windows.Forms.Button"
+        helpButton = dotNetObject "System.Windows.Forms.Button"
         helpButton.Text = "?"
-        helpButton.Location = dotNetObject "System.Drawing.Point" 294 102
+        helpButton.Location = dotNetObject "System.Drawing.Point" 324 217
         helpButton.Size = dotNetObject "System.Drawing.Size" 26 25
         helpButton.TabStop = false
         applyButtonTheme helpButton
         mainForm.Controls.Add helpButton
 
-        local settingsButton = dotNetObject "System.Windows.Forms.Button"
+        settingsButton = dotNetObject "System.Windows.Forms.Button"
         settingsButton.Text = "Settings"
-        settingsButton.Location = dotNetObject "System.Drawing.Point" 10 130
+        settingsButton.Location = dotNetObject "System.Drawing.Point" 10 245
         settingsButton.Size = dotNetObject "System.Drawing.Size" 100 25
         applyButtonTheme settingsButton
         mainForm.Controls.Add settingsButton
 
         logButton = dotNetObject "System.Windows.Forms.Button"
         logButton.Text = "Show Log"
-        logButton.Location = dotNetObject "System.Drawing.Point" 118 130
-        logButton.Size = dotNetObject "System.Drawing.Size" 202 25
+        logButton.Location = dotNetObject "System.Drawing.Point" 118 245
+        logButton.Size = dotNetObject "System.Drawing.Size" 232 25
         applyButtonTheme logButton
         mainForm.Controls.Add logButton
 
         logBorderPanel = dotNetObject "System.Windows.Forms.Panel"
-        logBorderPanel.Location = dotNetObject "System.Drawing.Point" 10 166
-        logBorderPanel.Size = dotNetObject "System.Drawing.Size" 310 264
+        logBorderPanel.Location = dotNetObject "System.Drawing.Point" 10 281
+        logBorderPanel.Size = dotNetObject "System.Drawing.Size" 340 264
         logBorderPanel.BackColor = themeInputBorderColor()
         logBorderPanel.Visible = false
         mainForm.Controls.Add logBorderPanel
 
         logBox = dotNetObject "System.Windows.Forms.RichTextBox"
         logBox.Location = dotNetObject "System.Drawing.Point" 1 1
-        logBox.Size = dotNetObject "System.Drawing.Size" 308 262
+        logBox.Size = dotNetObject "System.Drawing.Size" 338 262
         logBox.ReadOnly = true
         logBox.Multiline = true
         logBox.WordWrap = false
@@ -2274,6 +2326,8 @@ struct DropperAppManager (
         dotNet.addEventHandler logBox "MouseUp" onLogMouseUp
         dotNet.addEventHandler mainForm "FormClosing" onMainFormClosing
         dotNet.addEventHandler mainForm "LocationChanged" onMainFormLocationChanged
+        dotNet.setLifetimeControl settingsButton #dotnet
+        dotNet.setLifetimeControl helpButton #dotnet
 
         restoreWindowPosition()
         return true
