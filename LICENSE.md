@@ -40,6 +40,12 @@ license remain with Lukianenko Vasyl.
 Third-party components, if any, remain subject to their respective licenses.
 This license does not replace or restrict those licenses.
 
+Dropper includes the unmodified standalone 7-Zip Extra console executable
+(bin/7za.exe), Copyright (C) 1999-2026 Igor Pavlov. It is licensed under
+GNU LGPL 2.1 or later with additional BSD notices. See bin/7zip-NOTICE.txt,
+bin/7zip-LICENSE.txt, and bin/7zip-LGPL.txt for attribution, license terms,
+and the corresponding source code links at https://www.7-zip.org/.
+
 ## Disclaimer of warranty
 
 The Software is provided "as is", without warranties or conditions of any kind,

@@ -1,0 +1,24 @@
+Dropper includes the unmodified standalone 7-Zip Extra 26.03 console program.
+
+Component: bin/7za.exe (Windows x86; also runs on Windows x64 with WoW64)
+Copyright (C) 1999-2026 Igor Pavlov.
+License: GNU LGPL 2.1 or later, with the BSD notices in 7zip-LICENSE.txt.
+The full LGPL text is included in 7zip-LGPL.txt.
+
+Website and source code: https://www.7-zip.org/
+Release: https://github.com/ip7z/7zip/releases/tag/26.03
+Source archive: https://github.com/ip7z/7zip/releases/download/26.03/7z2603-src.7z
+Binary archive: https://github.com/ip7z/7zip/releases/download/26.03/7z2603-extra.7z
+
+Verified binary archive SHA-256 (matches the official GitHub release digest):
+191894e6acb3647ffb69ce630479ff318523b2e2b9890aa7f05c1127c2e59b8f
+Bundled 7za.exe SHA-256:
+e0b1d095d464c1051381a775a166e9650e74a95529dc4274a5adfd5515b406b0
+
+7za.exe is a separate command-line executable and needs no 7-Zip DLL or
+installed copy of 7-Zip. Dropper uses it for .7z archives.
+RAR extraction uses the separately installed program selected by Dropper.
+
+The Dropper Freeware License does not restrict your rights to this component.
+You may replace the bundled executable with a compatible version, subject to
+that version's own license. Dropper does not modify or statically link its code.

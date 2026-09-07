@@ -56,6 +56,347 @@ struct DropperPlacementData (
     nextX = 0.0
 )
 
+-- Keep unfinished jobs alive across window closure/reload. Only completion removes them.
+global dropperUpdateJobs
+if (dropperUpdateJobs == undefined) do dropperUpdateJobs = #()
+
+struct DropperUpdateJob (
+    ownerApp,
+    worker,
+    senderWorker,
+    runtimeFolderPath = "",
+    currentVersion = "",
+    stagingFolderPath = "",
+    downloadFilePath = "",
+    preparedEntryPath = "",
+    latestVersion = "",
+    outcome = "pending",
+    failureStep = "check",
+    keepStaging = false,
+    completionThreadId = 0,
+    workThreadId = 0,
+
+    fn normalizeFolderPath folderPath = (
+        return (trimRight (substituteString folderPath "/" "\\") "\\") + "\\"
+    ),
+
+    fn getVersionParts versionText = (
+        local cleanedVersion = toLower (versionText as string)
+        if (cleanedVersion.count > 0 and substring cleanedVersion 1 1 == "v") do (
+            cleanedVersion = substring cleanedVersion 2 (cleanedVersion.count - 1)
+        )
+        local rawParts = filterString cleanedVersion ".-+_"
+        local versionParts = #(0, 0, 0, 0)
+        for partIndex = 1 to (amin rawParts.count versionParts.count) do (
+            try (versionParts[partIndex] = rawParts[partIndex] as integer) catch (versionParts[partIndex] = 0)
+        )
+        return versionParts
+    ),
+
+    fn isNewerVersion candidateVersion currentVersion = (
+        local candidateParts = getVersionParts candidateVersion
+        local currentParts = getVersionParts currentVersion
+        for partIndex = 1 to candidateParts.count do (
+            if (candidateParts[partIndex] > currentParts[partIndex]) do return true
+            if (candidateParts[partIndex] < currentParts[partIndex]) do return false
+        )
+        return false
+    ),
+
+    fn fileIsNonEmpty filePath = (
+        if (not (dotNetClass "System.IO.File").Exists filePath) do return false
+        try (return ((dotNetObject "System.IO.FileInfo" filePath).Length > 0)) catch (return false)
+    ),
+
+    fn filePathIsInsideFolder sourceFilePath rootFolderPath = (
+        local normalizedFilePath = toLower ((dotNetClass "System.IO.Path").GetFullPath sourceFilePath)
+        local normalizedRootPath = toLower (normalizeFolderPath ((dotNetClass "System.IO.Path").GetFullPath rootFolderPath))
+        if (normalizedFilePath.count < normalizedRootPath.count) do return false
+        return (substring normalizedFilePath 1 normalizedRootPath.count) == normalizedRootPath
+    ),
+
+
+    fn readManifestSetting manifestFilePath settingKey = (
+        local manifestLines = (dotNetClass "System.IO.File").ReadAllLines manifestFilePath
+        local inPackageSection = false
+        for sourceLine in manifestLines do (
+            local trimmedLine = trimLeft (trimRight (sourceLine as string))
+            if (trimmedLine.count > 0) do (
+                if (substring trimmedLine 1 1 == "[") then (
+                    inPackageSection = toLower trimmedLine == "[package]"
+                ) else if (inPackageSection) do (
+                    local equalIndex = findString trimmedLine "="
+                    if (equalIndex != undefined and equalIndex > 1) do (
+                        if ((toLower (trimRight (substring trimmedLine 1 (equalIndex - 1)))) == toLower settingKey) do (
+                            return trimLeft (substring trimmedLine (equalIndex + 1) -1)
+                        )
+                    )
+                )
+            )
+        )
+        return ""
+    ),
+
+    fn getFinalUrlWithDotNet sourceUrl = (
+        local responseObject = undefined
+        try (
+            local requestObject = (dotNetClass "System.Net.WebRequest").Create sourceUrl
+            requestObject.Method = "HEAD"
+            requestObject.AllowAutoRedirect = true
+            requestObject.UserAgent = "Dropper-3dsMax"
+            requestObject.Timeout = 5000
+            requestObject.ReadWriteTimeout = 5000
+            responseObject = requestObject.GetResponse()
+            local finalUrl = responseObject.ResponseUri.AbsoluteUri as string
+            responseObject.Close()
+            return finalUrl
+        ) catch (
+            try (if (responseObject != undefined) do responseObject.Close()) catch()
+            return ""
+        )
+    ),
+
+    fn getFinalUrlWithCurl sourceUrl = (
+        local curlProcess = undefined
+        try (
+            local processInfo = dotNetObject "System.Diagnostics.ProcessStartInfo"
+            processInfo.FileName = "curl.exe"
+            processInfo.Arguments = "--location --fail --silent --show-error --proto =https --proto-redir =https --tlsv1.2 --connect-timeout 10 --max-time 60 --output NUL --write-out \"%{url_effective}\" \"" + sourceUrl + "\""
+            processInfo.UseShellExecute = false
+            processInfo.CreateNoWindow = true
+            processInfo.WindowStyle = (dotNetClass "System.Diagnostics.ProcessWindowStyle").Hidden
+            processInfo.RedirectStandardOutput = true
+            processInfo.RedirectStandardError = true
+            curlProcess = dotNetObject "System.Diagnostics.Process"
+            curlProcess.StartInfo = processInfo
+            if (not curlProcess.Start()) do return ""
+            local curlDeadline = (dotNetClass "System.Diagnostics.Stopwatch").StartNew()
+            local didCurlExit = false
+            while (not didCurlExit and not senderWorker.CancellationPending and curlDeadline.ElapsedMilliseconds < 65000) do (
+                didCurlExit = curlProcess.WaitForExit 100
+            )
+            if (not didCurlExit) do (
+                try (curlProcess.Kill()) catch()
+                try (curlProcess.Dispose()) catch()
+                return ""
+            )
+            local finalUrl = curlProcess.StandardOutput.ReadToEnd() as string
+            curlProcess.StandardError.ReadToEnd()
+            local curlSucceeded = curlProcess.ExitCode == 0 and finalUrl != ""
+            curlProcess.Dispose()
+            curlProcess = undefined
+            if (curlSucceeded) do return finalUrl
+            return ""
+        ) catch (
+            try (if (curlProcess != undefined) do curlProcess.Dispose()) catch()
+            return ""
+        )
+    ),
+
+    fn getLatestReleaseData = (
+        local latestReleaseUrl = "https://github.com/maxpkg-dev/Dropper/releases/latest"
+        local finalUrl = getFinalUrlWithDotNet latestReleaseUrl
+        if (senderWorker.CancellationPending) do return undefined
+        if (finalUrl == "") do finalUrl = getFinalUrlWithCurl latestReleaseUrl
+        if (finalUrl == "") do return undefined
+        local expectedPrefix = "https://github.com/maxpkg-dev/dropper/releases/tag/"
+        if (finalUrl.count <= expectedPrefix.count or (toLower (substring finalUrl 1 expectedPrefix.count)) != expectedPrefix) do return undefined
+        local releaseMarker = "/releases/tag/"
+        local markerIndex = findString (toLower finalUrl) releaseMarker
+        if (markerIndex == undefined) do return undefined
+        local releaseTag = substring finalUrl (markerIndex + releaseMarker.count) -1
+        releaseTag = (dotNetClass "System.Uri").UnescapeDataString releaseTag
+        if (releaseTag == "") do return undefined
+        local latestVersion = releaseTag
+        if (latestVersion.count > 0 and (toLower (substring latestVersion 1 1)) == "v") do latestVersion = substring latestVersion 2 (latestVersion.count - 1)
+        if (not (dotNetClass "System.Text.RegularExpressions.Regex").IsMatch latestVersion "^\\d+\\.\\d+\\.\\d+$") do return undefined
+        local packageFileName = "dropper@" + latestVersion + "@647fbcec-f70e-4305-92df-4f545e13354b.mzp"
+        local packageUrl = "https://github.com/maxpkg-dev/Dropper/releases/download/" + releaseTag + "/" + packageFileName
+        return #(latestVersion, packageUrl)
+    ),
+
+    fn downloadUpdateWithCurl sourceUrl destinationPath = (
+        local curlProcess = undefined
+        try (
+            local processInfo = dotNetObject "System.Diagnostics.ProcessStartInfo"
+            processInfo.FileName = "curl.exe"
+            processInfo.Arguments = "--location --fail --silent --show-error --proto =https --proto-redir =https --tlsv1.2 --connect-timeout 10 --max-time 60 --output \"" + destinationPath + "\" \"" + sourceUrl + "\""
+            processInfo.UseShellExecute = false
+            processInfo.CreateNoWindow = true
+            processInfo.WindowStyle = (dotNetClass "System.Diagnostics.ProcessWindowStyle").Hidden
+            curlProcess = dotNetObject "System.Diagnostics.Process"
+            curlProcess.StartInfo = processInfo
+            if (not curlProcess.Start()) do return false
+            local curlDeadline = (dotNetClass "System.Diagnostics.Stopwatch").StartNew()
+            local didCurlExit = false
+            while (not didCurlExit and not senderWorker.CancellationPending and curlDeadline.ElapsedMilliseconds < 65000) do (
+                didCurlExit = curlProcess.WaitForExit 100
+            )
+            if (not didCurlExit) do (
+                try (curlProcess.Kill()) catch()
+                try (curlProcess.Dispose()) catch()
+                try ((dotNetClass "System.IO.File").Delete destinationPath) catch()
+                return false
+            )
+            local curlSucceeded = curlProcess.ExitCode == 0 and fileIsNonEmpty destinationPath
+            curlProcess.Dispose()
+            curlProcess = undefined
+            return curlSucceeded
+        ) catch (
+            try (if (curlProcess != undefined) do curlProcess.Dispose()) catch()
+            try (if ((dotNetClass "System.IO.File").Exists destinationPath) do (dotNetClass "System.IO.File").Delete destinationPath) catch()
+            return false
+        )
+    ),
+
+    fn downloadUpdatePackage sourceUrl destinationPath = (
+        local responseObject = undefined
+        local inputStream = undefined
+        local outputStream = undefined
+        try (
+            if ((dotNetClass "System.IO.File").Exists destinationPath) do (dotNetClass "System.IO.File").Delete destinationPath
+            local requestObject = (dotNetClass "System.Net.WebRequest").Create sourceUrl
+            requestObject.Method = "GET"
+            requestObject.AllowAutoRedirect = true
+            requestObject.UserAgent = "Dropper-3dsMax"
+            requestObject.Timeout = 10000
+            requestObject.ReadWriteTimeout = 10000
+            responseObject = requestObject.GetResponse()
+            inputStream = responseObject.GetResponseStream()
+            outputStream = (dotNetClass "System.IO.File").Create destinationPath
+            local transferClock = (dotNetClass "System.Diagnostics.Stopwatch").StartNew()
+            local transferBuffer = dotNetObject "System.Byte[]" 65536
+            local readCount = 1
+            while (readCount > 0) do (
+                if (senderWorker.CancellationPending or transferClock.ElapsedMilliseconds > 60000) do throw "Update transfer interrupted."
+                readCount = inputStream.Read transferBuffer 0 65536
+                if (readCount > 0) do outputStream.Write transferBuffer 0 readCount
+            )
+            outputStream.Dispose()
+            outputStream = undefined
+            inputStream.Dispose()
+            inputStream = undefined
+            responseObject.Close()
+            responseObject = undefined
+            if (fileIsNonEmpty destinationPath) do return true
+        ) catch (
+            try (if (outputStream != undefined) do outputStream.Dispose()) catch()
+            try (if (inputStream != undefined) do inputStream.Dispose()) catch()
+            try (if (responseObject != undefined) do responseObject.Close()) catch()
+        )
+        try (if ((dotNetClass "System.IO.File").Exists destinationPath) do (dotNetClass "System.IO.File").Delete destinationPath) catch()
+        if (senderWorker.CancellationPending) do return false
+        return downloadUpdateWithCurl sourceUrl destinationPath
+    ),
+
+
+    fn cleanupStaging = (
+        -- Both paths are unique job-owned children of the OS temporary directory.
+        local tempRoot = (dotNetClass "System.IO.Path").GetTempPath()
+        if (downloadFilePath != "" and filePathIsInsideFolder downloadFilePath tempRoot) do (
+            try ((dotNetClass "System.IO.File").Delete downloadFilePath) catch()
+        )
+        if (not keepStaging and stagingFolderPath != "" and filePathIsInsideFolder stagingFolderPath tempRoot) do (
+            try (
+                if ((dotNetClass "System.IO.Directory").Exists stagingFolderPath) do (
+                    (dotNetClass "System.IO.Directory").Delete stagingFolderPath true
+                )
+            ) catch()
+        )
+        return true
+    ),
+
+    fn prepareUpdate = (
+        if (senderWorker.CancellationPending) do return "cancelled"
+        local releaseData = getLatestReleaseData()
+        if (senderWorker.CancellationPending) do return "cancelled"
+        if (releaseData == undefined) do throw "Release check failed."
+        latestVersion = releaseData[1]
+        if (not isNewerVersion latestVersion currentVersion) do return "current"
+
+        failureStep = "download"
+        if (not downloadUpdatePackage releaseData[2] downloadFilePath) do (
+            if (senderWorker.CancellationPending) do return "cancelled"
+            throw "Download failed."
+        )
+        if (senderWorker.CancellationPending) do return "cancelled"
+        failureStep = "package validation"
+        (dotNetClass "System.IO.Compression.ZipFile").ExtractToDirectory downloadFilePath stagingFolderPath
+        if (senderWorker.CancellationPending) do return "cancelled"
+        local manifestFilePath = (dotNetClass "System.IO.Path").Combine stagingFolderPath "manifest.ini"
+        if (not fileIsNonEmpty manifestFilePath) do throw "Manifest missing."
+        if ((toLower (readManifestSetting manifestFilePath "packageGuid")) != "647fbcec-f70e-4305-92df-4f545e13354b") do throw "Package identity mismatch."
+        if ((readManifestSetting manifestFilePath "version") != latestVersion) do throw "Package version mismatch."
+        local entryRelativePath = readManifestSetting manifestFilePath "entry"
+        if (entryRelativePath == "") do throw "Package entry missing."
+        preparedEntryPath = (dotNetClass "System.IO.Path").GetFullPath ((dotNetClass "System.IO.Path").Combine stagingFolderPath entryRelativePath)
+        if (not filePathIsInsideFolder preparedEntryPath stagingFolderPath) do throw "Package entry outside staging."
+        if ((toLower ((dotNetClass "System.IO.Path").GetExtension preparedEntryPath)) != ".mse" or not fileIsNonEmpty preparedEntryPath) do throw "Compiled entry missing."
+        return "ready"
+    ),
+
+    fn onDoWork workerSender eventArgs = (
+        -- No app/controls, Max APIs, installation, or fileIn on this thread.
+        senderWorker = workerSender
+        workThreadId = (dotNetClass "System.Threading.Thread").CurrentThread.ManagedThreadId
+        try (
+            (dotNetClass "System.Net.ServicePointManager").SecurityProtocol = (dotNetClass "System.Net.SecurityProtocolType").Tls12
+        ) catch()
+        try (outcome = prepareUpdate()) catch (outcome = "error")
+        if (workerSender.CancellationPending) do outcome = "cancelled"
+        if (outcome != "ready") do cleanupStaging()
+        eventArgs.Result = outcome
+        return true
+    ),
+
+    fn onCompleted workerSender eventArgs = (
+        completionThreadId = (dotNetClass "System.Threading.Thread").CurrentThread.ManagedThreadId
+        try (
+            if (eventArgs.Error != undefined) do outcome = "error"
+            if (eventArgs.Cancelled or workerSender.CancellationPending) do outcome = "cancelled"
+            if (ownerApp != undefined) do ownerApp.completeUpdateJob this
+        ) catch (
+            -- Do not let a MAXScript exception escape the .NET event boundary.
+            format "Dropper: automatic update completion failed.\n"
+        )
+        cleanupStaging()
+        ownerApp = undefined
+        try (dotNet.removeAllEventHandlers workerSender) catch()
+        try (workerSender.Dispose()) catch()
+        worker = undefined
+        senderWorker = undefined
+        local jobIndex = findItem dropperUpdateJobs this
+        if (jobIndex > 0) do deleteItem dropperUpdateJobs jobIndex
+        return true
+    ),
+
+    fn start = (
+        worker = dotNetObject "CSharpUtilities.SynchronizingBackgroundWorker"
+        worker.WorkerSupportsCancellation = true
+        dotNet.setLifetimeControl worker #mxs
+        dotNet.addEventHandler worker "DoWork" onDoWork
+        dotNet.addEventHandler worker "RunWorkerCompleted" onCompleted
+        append dropperUpdateJobs this
+        try (
+            worker.RunWorkerAsync()
+            return true
+        ) catch (
+            try (dotNet.removeAllEventHandlers worker) catch()
+            try (worker.Dispose()) catch()
+            worker = undefined
+            local jobIndex = findItem dropperUpdateJobs this
+            if (jobIndex > 0) do deleteItem dropperUpdateJobs jobIndex
+            return false
+        )
+    ),
+
+    fn cancelForClosedOwner = (
+        -- Do not wait, detach callbacks or dispose a worker that is still running.
+        ownerApp = undefined
+        if (worker != undefined) do try (worker.CancelAsync()) catch()
+        return true
+    )
+)
 struct DropperAppManager (
     versionContent = "Unknown",
     entryFilePath = "",
@@ -86,11 +427,10 @@ struct DropperAppManager (
     settingsOrientationPanelCheck = undefined,
     deferredDropTimer = undefined,
     deferredDropFilePaths = #(),
-    updateCheckTimer = undefined,
-    updateWorker = undefined,
+    updateJob = undefined,
+    uiThreadId = 0,
     updateRestartTimer = undefined,
     pendingRestartEntryPath = "",
-    updateRestartAttempts = 0,
     idlePromotionTimer = undefined,
     logPromotionTimer = undefined,
     logPromotionLinks = #(),
@@ -101,6 +441,7 @@ struct DropperAppManager (
     errorCount = 0,
     isBusy = false,
     isCancelRequested = false,
+    isClosing = false,
 
     fn normalizeFolderPath folderPath = (
         if (folderPath == undefined or folderPath == "") do return ""
@@ -296,7 +637,7 @@ struct DropperAppManager (
     ),
 
     fn restartIdlePromotionTimer = (
-        if (idlePromotionTimer == undefined) do return false
+        if (isClosing or idlePromotionTimer == undefined) do return false
         try (
             idlePromotionTimer.Stop()
             idlePromotionTimer.Start()
@@ -397,11 +738,12 @@ struct DropperAppManager (
     ),
 
     fn onIdlePromotionTimerTick senderObject eventArgs = (
-        if (not isBusy) do showRandomStatusPromotion()
+        if (not isClosing and not isBusy) do showRandomStatusPromotion()
         return true
     ),
 
     fn onLogPromotionTimerTick senderObject eventArgs = (
+        if (isClosing) do return false
         local promotionData = getRandomPromotionData()
         addPromotionLog promotionData
         return true
@@ -506,42 +848,6 @@ struct DropperAppManager (
         )
     ),
 
-    fn onMainFormClosing senderObject formClosingArgs = (
-        rememberWindowPosition()
-        isCancelRequested = true
-        if (deferredDropTimer != undefined) do (
-            try (deferredDropTimer.Stop()) catch()
-            try (deferredDropTimer.Dispose()) catch()
-            deferredDropTimer = undefined
-            deferredDropFilePaths = #()
-        )
-        if (updateCheckTimer != undefined) do (
-            try (updateCheckTimer.Stop()) catch()
-            try (updateCheckTimer.Dispose()) catch()
-            updateCheckTimer = undefined
-        )
-        if (updateWorker != undefined) do (
-            try (if (updateWorker.IsBusy) do updateWorker.CancelAsync()) catch()
-        )
-        if (idlePromotionTimer != undefined) do (
-            try (idlePromotionTimer.Stop()) catch()
-            try (idlePromotionTimer.Dispose()) catch()
-            idlePromotionTimer = undefined
-        )
-        if (logPromotionTimer != undefined) do (
-            try (logPromotionTimer.Stop()) catch()
-            try (logPromotionTimer.Dispose()) catch()
-            logPromotionTimer = undefined
-        )
-        if (helpForm != undefined) do try (helpForm.Close()) catch()
-        if (settingsForm != undefined) do try (settingsForm.Close()) catch()
-        if (orientationForm != undefined) do try (orientationForm.Close()) catch()
-        if (dropPanelImage != undefined) do (
-            try (dropPanelImage.Dispose()) catch()
-            dropPanelImage = undefined
-        )
-        enableAccelerators = true
-    ),
 
     fn positionOrientationForm = (
         if (mainForm == undefined or orientationForm == undefined) do return false
@@ -784,336 +1090,148 @@ struct DropperAppManager (
         return normalizedEntryPath == manifestEntryPath
     ),
 
-    fn getFinalUrlWithDotNet sourceUrl = (
-        local responseObject = undefined
-        try (
-            local requestObject = (dotNetClass "System.Net.WebRequest").Create sourceUrl
-            requestObject.Method = "HEAD"
-            requestObject.AllowAutoRedirect = true
-            requestObject.UserAgent = "Dropper-3dsMax"
-            requestObject.Timeout = 5000
-            requestObject.ReadWriteTimeout = 5000
-            responseObject = requestObject.GetResponse()
-            local finalUrl = responseObject.ResponseUri.AbsoluteUri as string
-            responseObject.Close()
-            return finalUrl
-        ) catch (
-            try (if (responseObject != undefined) do responseObject.Close()) catch()
-            return ""
-        )
-    ),
+    fn installPreparedUpdate updateTask = (
+        local stagedRoot = normalizeFolderPath updateTask.stagingFolderPath
+        local stagedManifest = stagedRoot + "manifest.ini"
+        if ((getINISetting stagedManifest "package" "version") != updateTask.latestVersion) do throw "Update manifest changed."
+        if ((toLower (getINISetting stagedManifest "package" "packageGuid")) != "647fbcec-f70e-4305-92df-4f545e13354b") do throw "Update identity changed."
+        if (not isNewerVersion updateTask.latestVersion (resolvePackageVersion())) do return ""
+        local entryRelativePath = getINISetting stagedManifest "package" "entry"
+        local destinationEntry = (dotNetClass "System.IO.Path").GetFullPath ((dotNetClass "System.IO.Path").Combine scriptFolderPath entryRelativePath)
+        if (not filePathIsInsideFolder destinationEntry scriptFolderPath or toLower destinationEntry != toLower entryFilePath) do throw "Update entry changed."
 
-    fn getFinalUrlWithCurl sourceUrl = (
-        local curlProcess = undefined
-        try (
-            local processInfo = dotNetObject "System.Diagnostics.ProcessStartInfo"
-            processInfo.FileName = "curl.exe"
-            processInfo.Arguments = "--location --fail --silent --show-error --proto =https --proto-redir =https --tlsv1.2 --connect-timeout 10 --max-time 60 --output NUL --write-out \"%{url_effective}\" \"" + sourceUrl + "\""
-            processInfo.UseShellExecute = false
-            processInfo.CreateNoWindow = true
-            processInfo.WindowStyle = (dotNetClass "System.Diagnostics.ProcessWindowStyle").Hidden
-            processInfo.RedirectStandardOutput = true
-            processInfo.RedirectStandardError = true
-            curlProcess = dotNetObject "System.Diagnostics.Process"
-            curlProcess.StartInfo = processInfo
-            if (not curlProcess.Start()) do return ""
-            local didCurlExit = curlProcess.WaitForExit 65000
-            if (not didCurlExit) do (
-                try (curlProcess.Kill()) catch()
-                try (curlProcess.Dispose()) catch()
-                return ""
-            )
-            local finalUrl = curlProcess.StandardOutput.ReadToEnd() as string
-            curlProcess.StandardError.ReadToEnd()
-            local curlSucceeded = curlProcess.ExitCode == 0 and finalUrl != ""
-            curlProcess.Dispose()
-            curlProcess = undefined
-            if (curlSucceeded) do return finalUrl
-            return ""
-        ) catch (
-            try (if (curlProcess != undefined) do curlProcess.Dispose()) catch()
-            return ""
-        )
-    ),
-
-    fn getLatestReleaseData = (
-        local latestReleaseUrl = "https://github.com/maxpkg-dev/Dropper/releases/latest"
-        local finalUrl = getFinalUrlWithDotNet latestReleaseUrl
-        if (finalUrl == "") do finalUrl = getFinalUrlWithCurl latestReleaseUrl
-        if (finalUrl == "") do return undefined
-        local releaseMarker = "/releases/tag/"
-        local markerIndex = findString (toLower finalUrl) releaseMarker
-        if (markerIndex == undefined) do return undefined
-        local releaseTag = substring finalUrl (markerIndex + releaseMarker.count) -1
-        releaseTag = (dotNetClass "System.Uri").UnescapeDataString releaseTag
-        if (releaseTag == "") do return undefined
-        local latestVersion = releaseTag
-        if (latestVersion.count > 0 and (toLower (substring latestVersion 1 1)) == "v") do latestVersion = substring latestVersion 2 (latestVersion.count - 1)
-        if (not (dotNetClass "System.Text.RegularExpressions.Regex").IsMatch latestVersion "^\\d+\\.\\d+\\.\\d+$") do return undefined
-        local packageFileName = "dropper@" + latestVersion + "@647fbcec-f70e-4305-92df-4f545e13354b.mzp"
-        local packageUrl = "https://github.com/maxpkg-dev/Dropper/releases/download/" + releaseTag + "/" + packageFileName
-        return #(latestVersion, packageUrl)
-    ),
-
-    fn downloadUpdateWithCurl sourceUrl destinationPath = (
-        local curlProcess = undefined
-        try (
-            local processInfo = dotNetObject "System.Diagnostics.ProcessStartInfo"
-            processInfo.FileName = "curl.exe"
-            processInfo.Arguments = "--location --fail --silent --show-error --proto =https --proto-redir =https --tlsv1.2 --connect-timeout 10 --max-time 60 --output \"" + destinationPath + "\" \"" + sourceUrl + "\""
-            processInfo.UseShellExecute = false
-            processInfo.CreateNoWindow = true
-            processInfo.WindowStyle = (dotNetClass "System.Diagnostics.ProcessWindowStyle").Hidden
-            curlProcess = dotNetObject "System.Diagnostics.Process"
-            curlProcess.StartInfo = processInfo
-            if (not curlProcess.Start()) do return false
-            local didCurlExit = curlProcess.WaitForExit 65000
-            if (not didCurlExit) do (
-                try (curlProcess.Kill()) catch()
-                try (curlProcess.Dispose()) catch()
-                try ((dotNetClass "System.IO.File").Delete destinationPath) catch()
-                return false
-            )
-            local curlSucceeded = curlProcess.ExitCode == 0 and fileIsNonEmpty destinationPath
-            curlProcess.Dispose()
-            curlProcess = undefined
-            return curlSucceeded
-        ) catch (
-            try (if (curlProcess != undefined) do curlProcess.Dispose()) catch()
-            try (if ((dotNetClass "System.IO.File").Exists destinationPath) do (dotNetClass "System.IO.File").Delete destinationPath) catch()
-            return false
-        )
-    ),
-
-    fn downloadUpdatePackage sourceUrl destinationPath = (
-        local responseObject = undefined
-        local inputStream = undefined
-        local outputStream = undefined
-        try (
-            if ((dotNetClass "System.IO.File").Exists destinationPath) do (dotNetClass "System.IO.File").Delete destinationPath
-            local requestObject = (dotNetClass "System.Net.WebRequest").Create sourceUrl
-            requestObject.Method = "GET"
-            requestObject.AllowAutoRedirect = true
-            requestObject.UserAgent = "Dropper-3dsMax"
-            requestObject.Timeout = 10000
-            requestObject.ReadWriteTimeout = 10000
-            responseObject = requestObject.GetResponse()
-            inputStream = responseObject.GetResponseStream()
-            outputStream = (dotNetClass "System.IO.File").Create destinationPath
-            inputStream.CopyTo outputStream
-            outputStream.Dispose()
-            outputStream = undefined
-            inputStream.Dispose()
-            inputStream = undefined
-            responseObject.Close()
-            responseObject = undefined
-            if (fileIsNonEmpty destinationPath) do return true
-        ) catch (
-            try (if (outputStream != undefined) do outputStream.Dispose()) catch()
-            try (if (inputStream != undefined) do inputStream.Dispose()) catch()
-            try (if (responseObject != undefined) do responseObject.Close()) catch()
-        )
-        try (if ((dotNetClass "System.IO.File").Exists destinationPath) do (dotNetClass "System.IO.File").Delete destinationPath) catch()
-        return downloadUpdateWithCurl sourceUrl destinationPath
-    ),
-
-    fn copyExtractedUpdate stagingFolderPath = (
-        local manifestPath = (dotNetClass "System.IO.Path").Combine stagingFolderPath "manifest.ini"
-        if (not (dotNetClass "System.IO.File").Exists manifestPath) do return ""
-        if ((toLower (getINISetting manifestPath "package" "packageGuid")) != "647fbcec-f70e-4305-92df-4f545e13354b") do return ""
-        local packageVersion = getINISetting manifestPath "package" "version"
-        if (not isNewerVersion packageVersion versionContent) do return ""
-        local packageEntry = getINISetting manifestPath "package" "entry"
-        if (packageEntry == undefined or packageEntry == "") do return ""
-        local sourceEntryPath = (dotNetClass "System.IO.Path").GetFullPath ((dotNetClass "System.IO.Path").Combine stagingFolderPath packageEntry)
-        if (not (filePathIsInsideFolder sourceEntryPath stagingFolderPath)) do return ""
-        if (not fileIsNonEmpty sourceEntryPath) do return ""
-
-        local searchOption = (dotNetClass "System.IO.SearchOption").AllDirectories
-        local extractedFiles = (dotNetClass "System.IO.Directory").GetFiles stagingFolderPath "*" searchOption
-        local excludedNames = #("mzp.run", "mzp.run.ms", "_install.ms", "_uninstall.ms", "Dropper.ini")
-        for sourceFilePath in extractedFiles do (
-            local relativePath = substring sourceFilePath (stagingFolderPath.count + 2) -1
-            local fileNameLower = toLower ((dotNetClass "System.IO.Path").GetFileName sourceFilePath)
-            if ((findItem excludedNames fileNameLower) == 0) do (
-                local destinationPath = (dotNetClass "System.IO.Path").Combine scriptFolderPath relativePath
-                local destinationFolder = (dotNetClass "System.IO.Path").GetDirectoryName destinationPath
-                if (not (dotNetClass "System.IO.Directory").Exists destinationFolder) do (
-                    (dotNetClass "System.IO.Directory").CreateDirectory destinationFolder
+        local fileClass = dotNetClass "System.IO.File"
+        local directoryClass = dotNetClass "System.IO.Directory"
+        local pathClass = dotNetClass "System.IO.Path"
+        local sourceFiles = directoryClass.GetFiles updateTask.stagingFolderPath "*" (dotNetClass "System.IO.SearchOption").AllDirectories
+        local excludedFiles = #("mzp.run", "mzp.run.ms", "_install.ms", "_uninstall.ms", "dropper.ini")
+        local copyPlan = #()
+        local metadataPlan = #()
+        local backupRoot = stagedRoot + ".rollback"
+        directoryClass.CreateDirectory backupRoot
+        for sourceFilePath in sourceFiles do (
+            local fileNameLower = toLower (pathClass.GetFileName sourceFilePath)
+            if ((findItem excludedFiles fileNameLower) == 0) do (
+                local relativeFilePath = substring sourceFilePath (stagedRoot.count + 1) -1
+                local destinationFilePath = pathClass.GetFullPath (pathClass.Combine scriptFolderPath relativeFilePath)
+                if (not filePathIsInsideFolder destinationFilePath scriptFolderPath) do throw "Unsafe update destination."
+                local backupFilePath = pathClass.Combine backupRoot relativeFilePath
+                local existedBefore = fileClass.Exists destinationFilePath
+                if (existedBefore) do (
+                    directoryClass.CreateDirectory (pathClass.GetDirectoryName backupFilePath)
+                    fileClass.Copy destinationFilePath backupFilePath true
                 )
-                (dotNetClass "System.IO.File").Copy sourceFilePath destinationPath true
+                local fileRecord = #(sourceFilePath, destinationFilePath, backupFilePath, existedBefore)
+                if (fileNameLower == "manifest.ini" or fileNameLower == "manifest.json") then (
+                    append metadataPlan fileRecord
+                ) else (
+                    append copyPlan fileRecord
+                )
             )
         )
-        local destinationEntryPath = (dotNetClass "System.IO.Path").GetFullPath ((dotNetClass "System.IO.Path").Combine scriptFolderPath packageEntry)
-        if (not (filePathIsInsideFolder destinationEntryPath scriptFolderPath)) do return ""
-        if (not fileIsNonEmpty destinationEntryPath) do return ""
-        return destinationEntryPath
+        join copyPlan metadataPlan
+        local attemptedCount = 0
+        try (
+            for fileRecord in copyPlan do (
+                attemptedCount += 1
+                directoryClass.CreateDirectory (pathClass.GetDirectoryName fileRecord[2])
+                fileClass.Copy fileRecord[1] fileRecord[2] true
+            )
+        ) catch (
+            local rollbackSucceeded = true
+            for fileIndex in attemptedCount to 1 by -1 do (
+                local fileRecord = copyPlan[fileIndex]
+                try (
+                    if (fileRecord[4]) then fileClass.Copy fileRecord[3] fileRecord[2] true else fileClass.Delete fileRecord[2]
+                ) catch (rollbackSucceeded = false)
+            )
+            if (not rollbackSucceeded) do updateTask.keepStaging = true
+            throw()
+        )
+        return destinationEntry
     ),
 
     fn onUpdateRestartTimerTick senderObject eventArgs = (
         senderObject.Stop()
-        updateRestartAttempts += 1
-        try (
-            if (pendingRestartEntryPath == "" or not (fileIsNonEmpty pendingRestartEntryPath)) do throw "The updated entry file is missing."
-            local restartFilePath = pendingRestartEntryPath
-            fileIn restartFilePath
+        if (isClosing or isCancelRequested) do (
+            try (dotNet.removeAllEventHandlers senderObject) catch()
             senderObject.Dispose()
             updateRestartTimer = undefined
             pendingRestartEntryPath = ""
+            return false
+        )
+        -- Restart only after any import/drop has finished.
+        if (isBusy) do (
+            senderObject.Start()
+            return true
+        )
+        local restartFilePath = pendingRestartEntryPath
+        try (dotNet.removeAllEventHandlers senderObject) catch()
+        senderObject.Dispose()
+        updateRestartTimer = undefined
+        pendingRestartEntryPath = ""
+        try (
+            if (restartFilePath == "" or not fileIsNonEmpty restartFilePath) do throw "Updated entry missing."
+            fileIn restartFilePath
             return true
         ) catch (
-            local restartErrorMessage = getCurrentException() as string
-            if (updateRestartAttempts < 3) then (
-                senderObject.Start()
-            ) else (
-                senderObject.Dispose()
-                updateRestartTimer = undefined
-                pendingRestartEntryPath = ""
-                format "Dropper automatic restart failed: %\n" restartErrorMessage
-            )
+            if (not isClosing) do addLog "Automatic restart failed. Run Dropper again." severityLevel: 3
             return false
         )
     ),
 
     fn scheduleUpdatedEntryRestart updatedEntryPath = (
-        if (updatedEntryPath == undefined or updatedEntryPath == "" or not (fileIsNonEmpty updatedEntryPath)) do return false
-        local activeEntryPath = entryFilePath
-        if (activeEntryPath != undefined and activeEntryPath != "" and (toLower ((dotNetClass "System.IO.Path").GetExtension activeEntryPath)) == ".mse" and fileIsNonEmpty activeEntryPath) then (
-            pendingRestartEntryPath = activeEntryPath
-        ) else (
-            pendingRestartEntryPath = updatedEntryPath
-        )
-        updateRestartAttempts = 0
+        if (isClosing or isCancelRequested or updatedEntryPath == "" or not fileIsNonEmpty updatedEntryPath) do return false
+        if (updateRestartTimer != undefined) do return false
+        pendingRestartEntryPath = entryFilePath
         updateRestartTimer = dotNetObject "System.Windows.Forms.Timer"
+        dotNet.setLifetimeControl updateRestartTimer #mxs
         updateRestartTimer.Interval = 350
         dotNet.addEventHandler updateRestartTimer "Tick" onUpdateRestartTimerTick
         updateRestartTimer.Start()
         return true
     ),
 
-    fn performGithubUpdateCore updateWorkerSender = (
-        if (not isInstalledPackageRuntime()) do return ""
-        local updateFilePath = ""
-        local stagingFolderPath = ""
-        try (
-            local servicePointManagerClass = dotNetClass "System.Net.ServicePointManager"
-            local securityProtocolClass = dotNetClass "System.Net.SecurityProtocolType"
-            servicePointManagerClass.SecurityProtocol = securityProtocolClass.Tls12
-
-            local releaseData = getLatestReleaseData()
-            if (releaseData == undefined or releaseData.count < 2) do throw "The latest release could not be resolved."
-            if (updateWorkerSender.CancellationPending) do return ""
-            local latestVersion = releaseData[1]
-            local packageUrl = releaseData[2]
-            if (not isNewerVersion latestVersion versionContent) do return ""
-
-            local tempFolderPath = (dotNetClass "System.IO.Path").GetTempPath()
-            local updateId = createGuidString()
-            updateFilePath = (dotNetClass "System.IO.Path").Combine tempFolderPath ("Dropper-" + updateId + ".mzp")
-            stagingFolderPath = (dotNetClass "System.IO.Path").Combine tempFolderPath ("DropperUpdate-" + updateId)
-            if (not downloadUpdatePackage packageUrl updateFilePath) do throw "The update package could not be downloaded."
-            if (updateWorkerSender.CancellationPending) do (
-                try ((dotNetClass "System.IO.File").Delete updateFilePath) catch()
-                return ""
+    fn completeUpdateJob updateTask = (
+        if (updateTask.completionThreadId != uiThreadId) do throw "Update completion must run on the UI thread."
+        if (isClosing or isCancelRequested or updateJob != updateTask or dropperApp != this) do return false
+        updateJob = undefined
+        if (mainForm == undefined or mainForm.IsDisposed) do return false
+        if (not isInstalledPackageRuntime()) do return false
+        if (updateTask.outcome == "ready") do (
+            try (
+                local installedEntryPath = installPreparedUpdate updateTask
+                if (installedEntryPath != "") do (
+                    addLog ("Update " + updateTask.latestVersion + " installed. Restarting Dropper.") severityLevel: 1
+                    scheduleUpdatedEntryRestart installedEntryPath
+                )
+            ) catch (
+                addLog (if updateTask.keepStaging then "Automatic update failed. Recovery files were kept in the update staging folder." else "Automatic update could not be installed; previous files were preserved.") severityLevel: 3
             )
-
-            (dotNetClass "System.IO.Directory").CreateDirectory stagingFolderPath
-            dotNet.loadAssembly "System.IO.Compression.FileSystem"
-            (dotNetClass "System.IO.Compression.ZipFile").ExtractToDirectory updateFilePath stagingFolderPath
-            if (updateWorkerSender.CancellationPending) do (
-                try ((dotNetClass "System.IO.Directory").Delete stagingFolderPath true) catch()
-                try ((dotNetClass "System.IO.File").Delete updateFilePath) catch()
-                return ""
-            )
-            local restartEntryPath = copyExtractedUpdate stagingFolderPath
-            if (restartEntryPath == "") do throw "The update package did not pass validation."
-
-            try ((dotNetClass "System.IO.Directory").Delete stagingFolderPath true) catch()
-            try ((dotNetClass "System.IO.File").Delete updateFilePath) catch()
-            return restartEntryPath
-        ) catch (
-            try (if (stagingFolderPath != "" and (dotNetClass "System.IO.Directory").Exists stagingFolderPath) do (dotNetClass "System.IO.Directory").Delete stagingFolderPath true) catch()
-            try (if (updateFilePath != "" and (dotNetClass "System.IO.File").Exists updateFilePath) do (dotNetClass "System.IO.File").Delete updateFilePath) catch()
-            return ""
         )
-    ),
-
-    fn performGithubUpdate updateWorkerSender = (
-        local updateMutex = undefined
-        local ownsUpdateMutex = false
-        local updatedEntryPath = ""
-        try (
-            updateMutex = dotNetObject "System.Threading.Mutex" false "Local\\DropperUpdate-647fbcec-f70e-4305-92df-4f545e13354b"
-            ownsUpdateMutex = updateMutex.WaitOne 70000
-            if (ownsUpdateMutex and not updateWorkerSender.CancellationPending) do (
-                updatedEntryPath = performGithubUpdateCore updateWorkerSender
-            )
-        ) catch (
-            updatedEntryPath = ""
+        if (updateTask.outcome == "error") do (
+            addLog ("Automatic update failed (" + updateTask.failureStep + ").") severityLevel: 2
         )
-        if (ownsUpdateMutex) do try (updateMutex.ReleaseMutex()) catch()
-        try (if (updateMutex != undefined) do updateMutex.Dispose()) catch()
-        return updatedEntryPath
-    ),
-
-    fn onUpdateWorkerDoWork senderObject eventArgs = (
-        if (senderObject.CancellationPending) do (
-            eventArgs.Cancel = true
-            return false
-        )
-        local updatedEntryPath = performGithubUpdate senderObject
-        if (senderObject.CancellationPending and updatedEntryPath == "") do (
-            eventArgs.Cancel = true
-            return false
-        )
-        eventArgs.Result = updatedEntryPath
-        return true
-    ),
-
-    fn onUpdateWorkerCompleted senderObject eventArgs = (
-        local updatedEntryPath = ""
-        try (
-            if (not eventArgs.Cancelled and eventArgs.Error == undefined and eventArgs.Result != undefined) do (
-                updatedEntryPath = eventArgs.Result as string
-            )
-        ) catch (
-            updatedEntryPath = ""
-        )
-        try (dotNet.removeEventHandler senderObject "DoWork" onUpdateWorkerDoWork) catch()
-        try (dotNet.removeEventHandler senderObject "RunWorkerCompleted" onUpdateWorkerCompleted) catch()
-        try (senderObject.Dispose()) catch()
-        updateWorker = undefined
-        if (not isCancelRequested and updatedEntryPath != "") do scheduleUpdatedEntryRestart updatedEntryPath
         return true
     ),
 
     fn startAutomaticUpdateWorker = (
-        if (not isInstalledPackageRuntime()) do return true
-        if (updateWorker != undefined) do (
-            try (if (updateWorker.IsBusy) do return true) catch()
-            try (updateWorker.Dispose()) catch()
-            updateWorker = undefined
-        )
+        if (isClosing or not isInstalledPackageRuntime() or updateJob != undefined) do return false
         try (
-            updateWorker = dotNetObject "CSharpUtilities.SynchronizingBackgroundWorker"
-            updateWorker.WorkerSupportsCancellation = true
-            dotNet.addEventHandler updateWorker "DoWork" onUpdateWorkerDoWork
-            dotNet.addEventHandler updateWorker "RunWorkerCompleted" onUpdateWorkerCompleted
-            updateWorker.RunWorkerAsync()
+            dotNet.loadAssembly "System.IO.Compression.FileSystem"
+            uiThreadId = (dotNetClass "System.Threading.Thread").CurrentThread.ManagedThreadId
+            local jobId = createGuidString()
+            local tempRoot = (dotNetClass "System.IO.Path").GetTempPath()
+            updateJob = DropperUpdateJob ownerApp: this runtimeFolderPath: scriptFolderPath currentVersion: versionContent
+            updateJob.downloadFilePath = (dotNetClass "System.IO.Path").Combine tempRoot ("Dropper-" + jobId + ".mzp")
+            updateJob.stagingFolderPath = (dotNetClass "System.IO.Path").Combine tempRoot ("DropperUpdate-" + jobId)
+            if (not updateJob.start()) do throw "Worker could not start."
             return true
         ) catch (
-            try (if (updateWorker != undefined) do updateWorker.Dispose()) catch()
-            updateWorker = undefined
+            updateJob = undefined
+            addLog "Automatic update could not start." severityLevel: 2
             return false
         )
-    ),
-
-    fn onAutomaticUpdateTimerTick senderObject eventArgs = (
-        senderObject.Stop()
-        senderObject.Dispose()
-        updateCheckTimer = undefined
-        startAutomaticUpdateWorker()
-        return true
     ),
 
     fn onHelpFormClosed senderObject eventArgs = (
@@ -2466,7 +2584,7 @@ struct DropperAppManager (
         try (senderObject.Dispose()) catch()
         deferredDropTimer = undefined
         deferredDropFilePaths = #()
-        if (queuedFilePaths.count > 0) do processDroppedFiles queuedFilePaths
+        if (not isClosing and queuedFilePaths.count > 0) do processDroppedFiles queuedFilePaths
         return true
     ),
 
@@ -2522,8 +2640,55 @@ struct DropperAppManager (
         return loadedImage
     ),
 
+    fn onMainFormClosing senderObject formClosingArgs = (
+        if (isClosing) do return true
+        isClosing = true
+        isCancelRequested = true
+        if (deferredDropTimer != undefined) do (
+            try (deferredDropTimer.Stop()) catch()
+            try (dotNet.removeEventHandler deferredDropTimer "Tick" onDeferredDropTimerTick) catch()
+            try (deferredDropTimer.Dispose()) catch()
+            deferredDropTimer = undefined
+            deferredDropFilePaths = #()
+        )
+        if (updateJob != undefined) do (
+            updateJob.cancelForClosedOwner()
+            updateJob = undefined
+        )
+        if (updateRestartTimer != undefined) do (
+            try (updateRestartTimer.Stop()) catch()
+            try (dotNet.removeEventHandler updateRestartTimer "Tick" onUpdateRestartTimerTick) catch()
+            try (updateRestartTimer.Dispose()) catch()
+            updateRestartTimer = undefined
+            pendingRestartEntryPath = ""
+        )
+        if (idlePromotionTimer != undefined) do (
+            try (idlePromotionTimer.Stop()) catch()
+            try (dotNet.removeEventHandler idlePromotionTimer "Tick" onIdlePromotionTimerTick) catch()
+            try (idlePromotionTimer.Dispose()) catch()
+            idlePromotionTimer = undefined
+        )
+        if (logPromotionTimer != undefined) do (
+            try (logPromotionTimer.Stop()) catch()
+            try (dotNet.removeEventHandler logPromotionTimer "Tick" onLogPromotionTimerTick) catch()
+            try (logPromotionTimer.Dispose()) catch()
+            logPromotionTimer = undefined
+        )
+        if (helpForm != undefined) do try (helpForm.Close()) catch()
+        if (settingsForm != undefined) do try (settingsForm.Close()) catch()
+        if (orientationForm != undefined) do try (orientationForm.Close()) catch()
+        if (dropPanelImage != undefined) do (
+            try (dropPanelImage.Dispose()) catch()
+            dropPanelImage = undefined
+        )
+        try (rememberWindowPosition()) catch (format "Dropper: could not save window position.\n")
+        enableAccelerators = true
+        return true
+    ),
+
     fn buildMainForm = (
         mainForm = dotNetObject "System.Windows.Forms.Form"
+        dotNet.setLifetimeControl mainForm #mxs
         mainForm.Text = "Dropper " + versionContent
         mainForm.FormBorderStyle = (dotNetClass "System.Windows.Forms.FormBorderStyle").FixedToolWindow
         mainForm.ClientSize = dotNetObject "System.Drawing.Size" 360 275
@@ -2628,23 +2793,21 @@ struct DropperAppManager (
             return true
         )
         isCancelRequested = false
+        isClosing = false
         buildMainForm()
         mainForm.Show()
         addLog ("Dropper " + versionContent + " is ready.")
         if (not canWriteSettingsFolder()) do (
             addLog ("Settings folder is not writable: " + scriptFolderPath) severityLevel:3
         )
-        if (isInstalledPackageRuntime()) do (
-            updateCheckTimer = dotNetObject "System.Windows.Forms.Timer"
-            updateCheckTimer.Interval = 1200
-            dotNet.addEventHandler updateCheckTimer "Tick" onAutomaticUpdateTimerTick
-            updateCheckTimer.Start()
-        )
+        if (isInstalledPackageRuntime()) do startAutomaticUpdateWorker()
         idlePromotionTimer = dotNetObject "System.Windows.Forms.Timer"
+        dotNet.setLifetimeControl idlePromotionTimer #mxs
         idlePromotionTimer.Interval = 10000
         dotNet.addEventHandler idlePromotionTimer "Tick" onIdlePromotionTimerTick
         idlePromotionTimer.Start()
         logPromotionTimer = dotNetObject "System.Windows.Forms.Timer"
+        dotNet.setLifetimeControl logPromotionTimer #mxs
         logPromotionTimer.Interval = 60000
         dotNet.addEventHandler logPromotionTimer "Tick" onLogPromotionTimerTick
         logPromotionTimer.Start()
